@@ -1,3 +1,5 @@
+<p align="center"><img src="logo.png" width="128" alt="白名单搜索"></p>
+
 # 白名单搜索
 
 为 AstrBot 提供受白名单约束的只读文件与代码工具：文本级搜索/读取 + LSP 语义级符号/引用/定义。
