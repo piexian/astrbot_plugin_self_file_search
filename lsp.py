@@ -14,6 +14,8 @@ import time
 import urllib.parse
 import urllib.request
 
+from astrbot.api import logger
+
 # 扩展名 -> 候选命令行（按优先级），PATH 里探测到哪个用哪个
 LSP_CANDIDATES: dict[str, list[list[str]]] = {
     "cs": [["csharp-ls"], ["omnisharp", "-lsp"]],
@@ -127,6 +129,8 @@ class LSPClient:
         self.last_used = time.monotonic()
 
     async def start(self) -> None:
+        started = time.monotonic()
+        logger.debug(f"LSP spawning: {self.argv} (root={self.root})")
         self.proc = await asyncio.create_subprocess_exec(
             *self.argv,
             stdin=asyncio.subprocess.PIPE,
@@ -150,10 +154,14 @@ class LSPClient:
             await self.stop()
             raise RuntimeError("initialize 失败")
         await self._notify("initialized", {})
+        logger.debug(
+            f"LSP initialized: {self.ext} @ {self.root} in {time.monotonic() - started:.1f}s"
+        )
 
     async def stop(self) -> None:
         proc, self.proc = self.proc, None
         if proc and proc.returncode is None:
+            logger.debug(f"LSP stopping: {self.ext} @ {self.root}")
             try:
                 self._send_raw("shutdown", {}, is_notify=False, msg_id=0)
                 self._send_raw("exit", None, is_notify=True)
@@ -200,6 +208,7 @@ class LSPClient:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    logger.warning(f"LSP {method} timed out after {timeout}s (root={self.root})")
                     raise TimeoutError(f"{method} 响应超时（{timeout}s）")
                 header = await asyncio.wait_for(
                     self.proc.stdout.readuntil(b"\r\n\r\n"), timeout=remaining
@@ -212,7 +221,9 @@ class LSPClient:
                 if message.get("id") != msg_id:
                     continue  # 服务器通知/服务端请求，检索场景不需要，直接丢
                 if "error" in message:
+                    logger.warning(f"LSP {method} server error: {message['error'].get('message', '')}")
                     raise RuntimeError(f"{method}: {message['error'].get('message', '')}")
+                logger.debug(f"LSP {method} ok in {time.monotonic() - (deadline - timeout):.2f}s")
                 return message.get("result")
 
     # ---- 检索用三个能力 ----
@@ -282,6 +293,10 @@ class LSPManager:
             client = self._clients.get(key)
             if client and client.proc and client.proc.returncode is None:
                 return client
+            if client is not None:
+                logger.warning(
+                    f"LSP process died (code={client.proc.returncode if client.proc else 'none'}), respawning: {ext} @ {root}"
+                )
             argv, tried = probe(ext, overrides)
             if argv is None:
                 raise RuntimeError(no_server_msg(ext, tried))
@@ -302,6 +317,7 @@ class LSPManager:
             now = time.monotonic()
             for key, client in list(self._clients.items()):
                 if now - client.last_used > self.idle_minutes * 60:
+                    logger.debug(f"LSP idle close: {key[1]} @ {key[0]}")
                     self._clients.pop(key, None)
                     try:
                         await client.stop()

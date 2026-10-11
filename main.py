@@ -143,8 +143,10 @@ async def _lsp_client(plugin, kwargs, root: str, ext_hint: str | None = None):
     try:
         return await plugin.lsp.get(root, ext, overrides)
     except RuntimeError as exc:
+        logger.debug(f"LSP unavailable: {exc}")
         return _err(str(exc))
     except (TimeoutError, OSError) as exc:
+        logger.warning(f"LSP startup failed: {exc}")
         return _err(f"语言服务器启动失败：{exc}")
 
 
@@ -193,6 +195,7 @@ def _pick_source(kwargs: dict, cfg: dict) -> tuple[str, str] | str:
         return _err(f"未知数据源 {src!r}，可用：{listing}")
     root = sources[src]["path"]
     if not os.path.isdir(root):
+        logger.warning(f"self file search: data source {src!r} path does not exist: {root}")
         return _err(f"数据源目录不存在：{root}")
     return src, root
 
@@ -324,6 +327,10 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             if incomplete:
                 break
 
+        logger.debug(
+            f"self_search: {src} mode={mode} pattern={pattern!r} "
+            f"total={total} scanned={scanned} incomplete={incomplete}"
+        )
         head = f"{_stamp(root)}[{src}] {mode} 模式"
         if mode == "files":
             entries = [f"{rel}（{len(matches[rel])} 处）" for rel in order][offset:offset + limit]
@@ -757,11 +764,13 @@ class SelfFileSearchPlugin(star.Star):
         self.config = config
         self.lsp = LSPManager(int(config.get("lsp_idle_minutes", 10) or 10))
         self._lsp_ext_cache: dict[str, str | None] = {}
-        if not _sources(config):
+        sources = _sources(config)
+        if not sources:
             # 全部数据源停用（含 AstrBot 白名单开关）时不注册工具，
             # 免得机器人面对五个永远报错的工具白白耗上下文。
             logger.info("astrbot_plugin_self_file_search: no enabled data source, tools not registered")
             return
+        logger.debug(f"self file search: enabled sources: {sorted(sources)}")
         context.add_llm_tools(
             SelfSearchTool(plugin_ref=self),
             SelfReadTool(plugin_ref=self),
