@@ -40,12 +40,12 @@
     "hint": "把 AstrBot 自身白名单注册为数据源，名称与自建条目冲突时自建优先。"
   },
   "max_matches_cap": {
-    "description": "code_search 单次命中行数上限",
+    "description": "self_search 单次命中条目上限",
     "type": "int",
     "default": 100
   },
   "max_read_chars": {
-    "description": "code_read 单次返回字符数上限",
+    "description": "self_read 单次返回字符数上限",
     "type": "int",
     "default": 32000
   },
@@ -63,8 +63,6 @@
     "description": "LSP 服务器覆盖，每项：扩展名|命令行",
     "type": "list",
     "hint": "例：cs|csharp-ls。留空则从 PATH 自动探测常见语言服务器；此配置优先于内置探测表，任何环境都能用。",
-    "editor_mode": true,
-    "editor_language": "text",
     "default": []
   }
 }
