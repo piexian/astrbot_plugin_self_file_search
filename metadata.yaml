@@ -1,0 +1,6 @@
+name: astrbot_plugin_self_file_search
+display_name: 白名单搜索
+description: 给 LLM 提供白名单目录内的代码搜索与读取工具。数据源由管理员登记，支持多源与版本戳；只读、输出限长，供非管理员环境安全使用。
+version: 1.0.0
+author: piexian
+repository: https://github.com/piexian/astrbot_plugin_self_file_search
