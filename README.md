@@ -2,7 +2,6 @@
 
 为 AstrBot 提供受白名单约束的只读文件与代码工具：文本级搜索/读取 + LSP 语义级符号/引用/定义。
 
-> **注意**：本插件是给 **LLM 用的工具集**，让群聊机器人能直接查代码与文件，替代「把源码嵌进向量知识库」。工具描述与参数描述为英文（进 LLM 上下文），管理面板与输出消息为中文。机制考据类问题仍由知识库语料首答，本插件负责「把代码给我看」的精确查询。
 
 ## 环境要求
 
@@ -58,11 +57,6 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 - 「这个枚举哪里用到了」→ `self_refs`，跨文件列出 `AI_PlayMusic.cs:572` 等引用
 - 「把 ThrowMethod.cs 给我看下」→ `self_read`
 
-### 与反编译自动更新脚本解耦（目录约定）
-
-数据源根目录放一个 `version.json`（含 `versionText` 或 `version` 字段），工具输出会自动带版本戳（如 `[EA 23.355]`）。外部更新脚本只负责把最新源码写进白名单目录并更新这个戳，插件不关心脚本怎么跑。
-
-C# 反编译场景推荐：`ilspycmd -p` 工程模式直出 `.cs + .csproj`，配合 [`csharp-ls`](https://github.com/metatool/csharp-ls)（`dotnet tool install --global csharp-ls`）即可做语义解析。
 
 ### 安全设计
 
@@ -95,7 +89,6 @@ astrbot_plugin_self_file_search/
 ├── lsp.py                           # 通用 LSP 后端：探测表 / 进程管理 / JSON-RPC
 ├── metadata.yaml                    # 插件元数据
 ├── _conf_schema.json                # 插件配置 Schema
-├── __init__.py
 └── README.md
 ```
 
@@ -103,7 +96,7 @@ astrbot_plugin_self_file_search/
 
 - [AstrBot 文档](https://docs.astrbot.app/)
 - [插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [fastctx](https://github.com/yc-duan/fastctx) —— 接口设计借鉴来源（grep 多模式、批量 read 与 Partial 续读、schema 可移植子集）
+- [fastctx](https://github.com/yc-duan/fastctx) —— 接口设计借鉴来源
 - [Issues](https://github.com/piexian/astrbot_plugin_self_file_search/issues)
 
 <div align="center">
