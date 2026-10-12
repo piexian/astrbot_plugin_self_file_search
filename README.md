@@ -1,4 +1,4 @@
-<p align="center"><img src="logo.png" width="128" alt="白名单搜索"></p>
+<p align="center"><img src="https://cdn.jsdelivr.net/gh/piexian/astrbot_plugin_self_file_search@360518e5526f6104f2caadd8173574e97b8429a2/logo.svg" width="128" alt="白名单搜索"></p>
 
 # 白名单搜索
 
