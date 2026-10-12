@@ -410,10 +410,13 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
     name: str = "self_read"
     description: str = (
         "Read text/code files inside a whitelisted data source (relative path, "
-        "line-numbered, length-capped). Paths come from self_search / self_symbols "
-        "hits; follow the start_line hint to continue long files. Pass `files` "
-        "(up to 8) to batch-read several files in one call with a shared output "
-        "budget; per-file problems are reported inline. Omit files to read a single path."
+        "line-numbered, length-capped). Use start_line/end_line to read a specific "
+        "line range (end_line negative counts from the end, e.g. -1 = last line) "
+        "instead of always reading from the top. Paths come from self_search / "
+        "self_symbols hits; follow the start_line hint to continue long files. Pass "
+        "`files` (up to 8) to batch-read several files in one call with a shared "
+        "output budget; per-file problems are reported inline. Omit files to read "
+        "a single path."
     )
     parameters: dict = Field(default_factory=lambda: {
         "type": "object",
@@ -434,6 +437,7 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
                     "properties": {
                         "path": {"type": "string", "description": "Relative path inside the data source"},
                         "start_line": {"type": "integer", "description": "1-based start line"},
+                        "end_line": {"type": "integer", "description": "Optional 1-based inclusive end line; negative counts from the end (-1 = last line)"},
                         "max_chars": {"type": "integer", "description": "Max characters returned for this file"},
                     },
                     "required": ["path"],
@@ -442,6 +446,10 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
             "start_line": {
                 "type": "integer",
                 "description": "Optional 1-based start line; default 1",
+            },
+            "end_line": {
+                "type": "integer",
+                "description": "Optional 1-based inclusive end line; negative counts from the end (-1 = last line)",
             },
             "max_chars": {
                 "type": "integer",
@@ -488,6 +496,7 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
         head, body, more = self._read_entry(
             root, {"path": rel,
                    "start_line": kwargs.get("start_line"),
+                   "end_line": kwargs.get("end_line"),
                    "max_chars": kwargs.get("max_chars")},
             min(int(kwargs.get("max_chars", 8000) or 8000),
                 int(cfg.get("max_read_chars", 32000) or 32000)),
@@ -514,9 +523,20 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
             return f"{rel}: 读取失败（{exc}）", "", False
         total = len(lines)
         s = min(start, max(total, 1))
+        # end_line: 闭区间；负数从末尾倒数（-1 = 最后一行）
+        raw_end = entry.get("end_line")
+        if raw_end not in (None, ""):
+            try:
+                n = int(raw_end)
+            except (TypeError, ValueError):
+                n = total
+            stop = total + 1 + n if n < 0 else n
+            stop = min(max(stop, s), total)
+        else:
+            stop = total
         out: list[str] = []
         used = 0
-        for i in range(s, total + 1):
+        for i in range(s, stop + 1):
             piece = f"{i}: {lines[i - 1].rstrip()[:MAX_LINE_CHARS]}\n"
             if used + len(piece) > max_chars and out:
                 break
@@ -525,7 +545,7 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
         end = s + len(out) - 1
         head = f"{rel}（共 {total} 行，显示 {s}-{end} 行）"
         if end < total:
-            head += f"，后续 {total - end} 行未显示，可 start_line={end + 1} 续读"
+            head += f"，后续 {total - end} 行未显示，可 start_line={end + 1} 续读（或 start_line={end + 1}&end_line=... 指定区间）"
             return head, "".join(out), True
         return head, "".join(out), False
 
