@@ -523,9 +523,18 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
                    + " 继续读）") if mm else "\n（Partial：未显示完整，用 start_line 指定起点继续读）"
             text += tip
         m = re.search(r"显示 (\d+)-(\d+) 行", head)
+        mtotal = re.search(r"共 (\d+) 行", head)
+        total_hint = int(mtotal.group(1)) if mtotal else 0
+        page_size = (int(m.group(2)) - int(m.group(1)) + 1) if m else 0
         if m:
             nxt = int(m.group(2)) + 1
-            next_hint = ("输出超限：改用 start_line=" + str(nxt) + " 继续读，或 start_line=" + str(nxt) + "&end_line=... 指定区间。")
+            last = int(m.group(2))
+            nxt = last + 1
+            next_hint = (
+                "输出超限：改用 start_line=" + str(nxt) + " 继续读"
+                "（读到底 start_line=" + str(nxt) + "&end_line=" + str(total_hint) +
+                "；只读一页 start_line=" + str(nxt) + "&end_line=" + str(min(total_hint, last + page_size)) + "）。"
+            )
         else:
             next_hint = "输出超限：用 start_line 指定起点继续读。"
         return _limit(f"{_stamp(root)}[{src}] " + text, SEARCH_OUTPUT_CAP, next_hint)
@@ -572,10 +581,14 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
             left_lines = total - end
             left_chars = sum(len(x) for x in lines[end:])
             pages = max(1, -(-left_chars // max(max_chars, 1)))
+            nxt = end + 1
+            # 精确给出下一页的区间终点，别让模型自己猜
+            page_end = min(total, nxt + max(1, len(out)) - 1)
             head += (
                 f"，还剩 {left_lines} 行未读（约 {left_chars} 字符，按当前 max_chars"
-                f" 估计还需 {pages} 次），用 start_line={end + 1} 续读"
-                f"（或 start_line={end + 1}&end_line=... 指定区间）"
+                f" 估计还需 {pages} 次）；续读：start_line={nxt}（读到文件末尾则用"
+                f" start_line={nxt}&end_line={total}，只读下一页用"
+                f" start_line={nxt}&end_line={page_end}）"
             )
             return head, "".join(out), True
         return head, "".join(out), False
