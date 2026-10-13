@@ -56,7 +56,8 @@ def _astrbot_whitelist_sources() -> dict[str, dict]:
             get_astrbot_system_tmp_path,
             get_astrbot_workspaces_path,
         )
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - AstrBot 路径模块不可用时只影响白名单并入，不影响自建源
+        logger.debug(f"astrbot path helpers unavailable: {exc}")
         return out
 
     def add(name: str, path: str, desc: str) -> None:
@@ -327,6 +328,15 @@ def _is_excluded(rel: str, exclude: list[str]) -> bool:
     return False
 
 
+def _read_lines(path: str) -> list[str]:
+    """同步读全部行（供 asyncio.to_thread 调用，避免 async 里阻塞 open）。"""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.readlines()
+    except OSError:
+        return []
+
+
 def _compile(pattern: str, case_sensitive: bool, is_regex: bool):
     flags = 0 if case_sensitive else re.IGNORECASE
     return re.compile(pattern if is_regex else re.escape(pattern), flags)
@@ -452,18 +462,18 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 try:
                     if os.path.getsize(path) > MAX_FILE_BYTES:
                         continue
-                    with open(path, encoding="utf-8", errors="replace") as f:
-                        for i, line in enumerate(f, 1):
-                            if rx.search(line):
-                                rel = os.path.relpath(path, root).replace("\\", "/")
-                                if rel not in matches:
-                                    matches[rel] = {}
-                                    order.append(rel)
-                                matches[rel][i] = line.rstrip()[:MAX_LINE_CHARS]
-                                total += 1
-                                if total >= 5000:
-                                    incomplete = True
-                                    break
+                    lines = await asyncio.to_thread(_read_lines, path)
+                    for i, line in enumerate(lines, 1):
+                        if rx.search(line):
+                            rel = os.path.relpath(path, root).replace("\\", "/")
+                            if rel not in matches:
+                                matches[rel] = {}
+                                order.append(rel)
+                            matches[rel][i] = line.rstrip()[:MAX_LINE_CHARS]
+                            total += 1
+                            if total >= 5000:
+                                incomplete = True
+                                break
                 except OSError:
                     continue
                 scanned += 1
@@ -949,7 +959,7 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
         picked = _pick_source(kwargs, cfg)
         if isinstance(picked, str):
             return picked
-        src, root = picked
+        _src, root = picked
         if not self.plugin_ref._lsp_ext_cache.get(root):
             self.plugin_ref._lsp_ext_cache[root] = guess_ext(root)
         client = await _lsp_client(
@@ -963,7 +973,7 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
         limit = max(1, min(int(kwargs.get("max", 30) or 30), 100))
         try:
             result = await client.symbols(query)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - LSP 异常需转成用户可读错误
             return _err(f"符号搜索失败：{exc}")
         items = result if isinstance(result, list) else []
         lines: list[str] = []
@@ -1031,7 +1041,7 @@ class SelfRefsTool(FunctionTool[AstrAgentContext]):
         picked = _pick_source(kwargs, cfg)
         if isinstance(picked, str):
             return picked
-        src, root = picked
+        _src, root = picked
         rel = str(kwargs.get("path", "")).strip()
         abs_path = _contain(root, rel)
         if abs_path is None:
@@ -1063,7 +1073,7 @@ class SelfRefsTool(FunctionTool[AstrAgentContext]):
                 )
             else:
                 result = await client.definition(abs_path, line1 - 1, char)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - LSP 异常需转成用户可读错误
             return _err(f"语言服务器查询失败：{exc}")
         body = _format_locations(root, result, limit, root_real)
         head = f"符号 {symbol!r} 的{('定义' if mode == 'def' else '引用')}："
@@ -1176,7 +1186,7 @@ class SelfFileSearchPlugin(star.Star):
                 f"frecency loaded: {len(self.kv)} buckets, "
                 f"{sum(len(v) for v in self.kv.values())} entries"
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - KV 读取失败时降级为不排序，不能让插件起不来
             logger.warning(f"frecency load failed, ranking disabled: {exc}")
             self.kv_ready = False
 
@@ -1190,7 +1200,7 @@ class SelfFileSearchPlugin(star.Star):
             else:
                 self.kv.pop(_frecency_key(src), None)
             await self.put_kv_data("frecency", self.kv)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - KV 写入失败只影响排序持久化，不影响本次结果
             logger.warning(f"frecency save failed: {exc}")
 
     async def terminate(self) -> None:
@@ -1201,6 +1211,6 @@ class SelfFileSearchPlugin(star.Star):
             await self.delete_kv_data("frecency")
             self.kv, self.kv_ready = {}, False
             logger.info("astrbot_plugin_self_file_search: frecency KV cleared")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - 卸载清理失败只记日志，不阻塞关闭流程
             logger.warning(f"frecency KV cleanup failed: {exc}")
         await self.lsp.shutdown()
