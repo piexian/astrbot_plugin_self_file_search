@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  format:
+    name: Ruff Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff format check
+        run: ruff format --check .
+
+  lint:
+    name: Ruff Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff lint
+        run: ruff check .
+
+  metadata:
+    name: Plugin Metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install pyyaml
+        run: pip install pyyaml
+
+      # AstrBot 要求 metadata.yaml 必填 name / desc / version / author（四个都必须是字符串），
+      # 仓库地址字段叫 repo（不是 repository）。见 astrbot/core/star/updater.py。
+      - name: Validate metadata.yaml
+        run: |
+          python - <<'PY'
+          import yaml
+
+          REQUIRED = ("name", "desc", "version", "author")
+          md = yaml.safe_load(open("metadata.yaml", encoding="utf-8").read())
+          if not isinstance(md, dict):
+              raise SystemExit("metadata.yaml 格式错误：应为映射。")
+
+          norm = dict(md)
+          if "desc" not in norm and "description" in norm:
+              norm["desc"] = norm["description"]
+
+          missing = [f for f in REQUIRED if f not in norm]
+          if missing:
+              raise SystemExit(f"metadata.yaml 缺少必需字段: {', '.join(missing)}")
+
+          not_str = [f for f in REQUIRED if not isinstance(norm[f], str)]
+          if not_str:
+              raise SystemExit(f"metadata.yaml 字段必须为字符串: {', '.join(not_str)}")
+
+          if "repository" in norm:
+              raise SystemExit("metadata.yaml 用了 repository，AstrBot 识别的字段名是 repo。")
+          if not norm.get("repo"):
+              print("::warning::metadata.yaml 未设置 repo 字段，插件市场将不显示仓库链接。")
+
+          print(f"metadata.yaml OK: {norm['name']} {norm['version']} by {norm['author']}")
+          PY
+
+      - name: Validate _conf_schema.json
+        run: |
+          python - <<'PY'
+          import json
+
+          schema = json.load(open("_conf_schema.json", encoding="utf-8"))
+          if not isinstance(schema, dict):
+              raise SystemExit("_conf_schema.json 格式错误：应为对象。")
+          for key, node in schema.items():
+              if not isinstance(node, dict) or "type" not in node:
+                  raise SystemExit(f"_conf_schema.json 条目 {key} 缺少 type 字段。")
+          print(f"_conf_schema.json OK: {len(schema)} 个配置项")
+          PY
