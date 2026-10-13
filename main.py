@@ -348,7 +348,9 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             return f"{head}，无可命中内容。"
         body = "\n".join(entries)
         if len(head) + len(body) > SEARCH_OUTPUT_CAP:
-            body = body[: SEARCH_OUTPUT_CAP - len(head)] + "\n…（输出超限截断）"
+            shown = len(entries)
+            next_hint = ("本次已输出 " + str(shown) + " 条：翻页用 offset=" + str(offset + shown) + " 继续，或用 file_glob 收窄、max_matches 调小后重搜。")
+            body = body[: SEARCH_OUTPUT_CAP - len(head)] + "\n…（输出超限截断）" + next_hint
         return head + "\n" + body
 
     @staticmethod
@@ -488,7 +490,10 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
             text = f"[{src}] 批量读取 {len(files)} 个文件\n" + "\n".join(blocks)
             if truncated:
                 text += "\n（Partial：有文件未显示完整，按各文件头提示的 start_line 续读）"
-            return _limit(text, SEARCH_OUTPUT_CAP)
+            return _limit(
+                text, SEARCH_OUTPUT_CAP,
+                "输出超限：改小各文件的 max_chars，或拆成两次调用分批读。",
+            )
 
         rel = str(kwargs.get("path", "")).strip()
         if not rel:
@@ -503,8 +508,18 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
         )
         text = f"{head}\n{body}" if body else head
         if more:
-            text += "（Partial：未显示完整，按头部提示续读）"
-        return _limit(f"{_stamp(root)}[{src}] " + text, SEARCH_OUTPUT_CAP)
+            # 续读提示放正文末尾：模型读到结尾才需要知道下一步
+            mm = re.search(r"显示 (\d+)-(\d+) 行", head)
+            tip = ("\n（Partial：未显示完整，用 start_line=" + str(int(mm.group(2)) + 1)
+                   + " 继续读）") if mm else "\n（Partial：未显示完整，用 start_line 指定起点继续读）"
+            text += tip
+        m = re.search(r"显示 (\d+)-(\d+) 行", head)
+        if m:
+            nxt = int(m.group(2)) + 1
+            next_hint = ("输出超限：改用 start_line=" + str(nxt) + " 继续读，或 start_line=" + str(nxt) + "&end_line=... 指定区间。")
+        else:
+            next_hint = "输出超限：用 start_line 指定起点继续读。"
+        return _limit(f"{_stamp(root)}[{src}] " + text, SEARCH_OUTPUT_CAP, next_hint)
 
     def _read_entry(self, root: str, entry: dict, default_chars: int) -> tuple[str, str, bool]:
         """读单个条目，返回 (头信息, 正文, 是否还有剩余)。"""
@@ -610,7 +625,10 @@ class SelfGlobTool(FunctionTool[AstrAgentContext]):
         body = "\n".join(shown)
         if total > len(shown):
             body += f"\n…（其余 {total - len(shown)} 个未显示，可收窄 pattern）"
-        return _limit(head + "\n" + body, SEARCH_OUTPUT_CAP)
+        return _limit(
+            head + "\n" + body, SEARCH_OUTPUT_CAP,
+            "输出超限：收窄 pattern（如加前缀 Card*）后重列。",
+        )
 
 
 @dataclass
@@ -740,7 +758,10 @@ class SelfRefsTool(FunctionTool[AstrAgentContext]):
         head = f"符号 {symbol!r} 的{('定义' if mode == 'def' else '引用')}："
         if not body:
             return head + " 无结果（若服务器刚启动，可稍后重试）。"
-        return _limit(head + "\n" + body, 16000)
+        return _limit(
+            head + "\n" + body, SEARCH_OUTPUT_CAP,
+            "输出超限：调小 max 只看前几条，或换个更具体的 symbol 重查。",
+        )
 
 
 @dataclass
@@ -770,10 +791,13 @@ class SelfDefTool(FunctionTool[AstrAgentContext]):
         return await SelfRefsTool(plugin_ref=self.plugin_ref)._run("def", kwargs)
 
 
-def _limit(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
+def _limit(text: str, max_chars: int, next_hint: str = "") -> str:
+    if len(text) <= max_chars:  # 截断时给出「下一步怎么读」
         return text
-    return text[:max_chars] + f"\n…（输出超限被截断，共 {len(text)} 字符）"
+    tail = "\n…（输出超限被截断，共 " + str(len(text)) + " 字符）"
+    if next_hint:
+        tail += " " + next_hint
+    return text[:max_chars] + tail
 
 
 class SelfFileSearchPlugin(star.Star):

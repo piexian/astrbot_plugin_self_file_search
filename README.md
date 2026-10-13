@@ -38,7 +38,7 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 | 工具 | 功能 |
 |------|------|
 | `self_search` | 目录内 grep：`mode=content`（命中行，默认）/ `files`（命中文件）/ `count`（每文件计数）；支持正则、大小写、`context_lines` 前后文、`offset` 翻页 |
-| `self_read` | 读文件（带行号）；`start_line`/`end_line` 指定行区间（`end_line` 负数从末尾倒数，`-1` = 最后一行），`files` 数组一次最多批量读 8 个，共享输出预算，逐文件报错 |
+| `self_read` | 读文件（带行号）；`start_line`/`end_line` 指定行区间（`end_line` 负数从末尾倒数，`-1` = 最后一行），截断时末尾给出精确续读参数；`files` 数组一次最多批量读 8 个，共享输出预算，逐文件报错 |
 | `self_glob` | 按文件名通配符列文件（如 `*.cs`、`Card*.cs`） |
 
 ### LSP 语义级（需要环境里有对应语言服务器）
