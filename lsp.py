@@ -1,6 +1,4 @@
-"""通用 LSP 后端：自动探测环境 PATH 里的语言服务器，按数据源根目录管理进程生命周期。
-
-"""
+"""通用 LSP 后端：自动探测环境 PATH 里的语言服务器，按数据源根目录管理进程生命周期。"""
 
 from __future__ import annotations
 
@@ -37,16 +35,43 @@ LSP_CANDIDATES: dict[str, list[list[str]]] = {
 }
 
 LANGUAGE_IDS = {
-    "cs": "csharp", "go": "go", "rs": "rust", "ts": "typescript", "tsx": "typescriptreact",
-    "js": "javascript", "py": "python", "c": "c", "cpp": "cpp", "cc": "cpp", "h": "c",
-    "lua": "lua", "php": "php", "rb": "ruby", "zig": "zig", "dart": "dart",
+    "cs": "csharp",
+    "go": "go",
+    "rs": "rust",
+    "ts": "typescript",
+    "tsx": "typescriptreact",
+    "js": "javascript",
+    "py": "python",
+    "c": "c",
+    "cpp": "cpp",
+    "cc": "cpp",
+    "h": "c",
+    "lua": "lua",
+    "php": "php",
+    "rb": "ruby",
+    "zig": "zig",
+    "dart": "dart",
 }
 
 SYMBOL_KINDS = {
-    1: "file", 2: "module", 3: "namespace", 4: "package", 5: "class", 6: "method",
-    7: "property", 8: "field", 9: "constructor", 10: "enum", 11: "interface",
-    12: "function", 13: "variable", 14: "constant", 15: "string", 22: "struct",
-    23: "event", 25: "type-parameter",
+    1: "file",
+    2: "module",
+    3: "namespace",
+    4: "package",
+    5: "class",
+    6: "method",
+    7: "property",
+    8: "field",
+    9: "constructor",
+    10: "enum",
+    11: "interface",
+    12: "function",
+    13: "variable",
+    14: "constant",
+    15: "string",
+    22: "struct",
+    23: "event",
+    25: "type-parameter",
 }
 
 
@@ -68,7 +93,9 @@ def parse_overrides(items) -> dict[str, list[list[str]]]:
     return out
 
 
-def probe(ext: str, overrides: dict[str, list[list[str]]]) -> tuple[list[str] | None, list[str]]:
+def probe(
+    ext: str, overrides: dict[str, list[list[str]]]
+) -> tuple[list[str] | None, list[str]]:
     """返回 (argv|None, 已尝试列表)。argv 是 PATH 探测到的可执行文件绝对路径 + 参数。"""
     tried: list[str] = []
     for argv in overrides.get(ext, []) + LSP_CANDIDATES.get(ext, []):
@@ -94,7 +121,9 @@ def guess_ext(root: str) -> str | None:
 
 
 def _path_to_uri(path: str) -> str:
-    return urllib.parse.quote("file:///" + os.path.abspath(path).replace("\\", "/"), safe="/:")
+    return urllib.parse.quote(
+        "file:///" + os.path.abspath(path).replace("\\", "/"), safe="/:"
+    )
 
 
 def uri_to_path(uri: str) -> str:
@@ -144,7 +173,10 @@ class LSPClient:
                 "processId": os.getpid(),
                 "rootUri": _path_to_uri(self.root),
                 "workspaceFolders": [
-                    {"uri": _path_to_uri(self.root), "name": os.path.basename(self.root)}
+                    {
+                        "uri": _path_to_uri(self.root),
+                        "name": os.path.basename(self.root),
+                    }
                 ],
                 "capabilities": {},
             },
@@ -181,7 +213,9 @@ class LSPClient:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         return f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
 
-    def _send_raw(self, method: str, params, is_notify: bool, msg_id: int | None = None) -> None:
+    def _send_raw(
+        self, method: str, params, is_notify: bool, msg_id: int | None = None
+    ) -> None:
         if not (self.proc and self.proc.stdin):
             raise RuntimeError("服务器进程未运行")
         payload: dict = {"jsonrpc": "2.0", "method": method}
@@ -208,7 +242,9 @@ class LSPClient:
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    logger.warning(f"LSP {method} timed out after {timeout}s (root={self.root})")
+                    logger.warning(
+                        f"LSP {method} timed out after {timeout}s (root={self.root})"
+                    )
                     raise TimeoutError(f"{method} 响应超时（{timeout}s）")
                 header = await asyncio.wait_for(
                     self.proc.stdout.readuntil(b"\r\n\r\n"), timeout=remaining
@@ -221,9 +257,15 @@ class LSPClient:
                 if message.get("id") != msg_id:
                     continue  # 服务器通知/服务端请求，检索场景不需要，直接丢
                 if "error" in message:
-                    logger.warning(f"LSP {method} server error: {message['error'].get('message', '')}")
-                    raise RuntimeError(f"{method}: {message['error'].get('message', '')}")
-                logger.debug(f"LSP {method} ok in {time.monotonic() - (deadline - timeout):.2f}s")
+                    logger.warning(
+                        f"LSP {method} server error: {message['error'].get('message', '')}"
+                    )
+                    raise RuntimeError(
+                        f"{method}: {message['error'].get('message', '')}"
+                    )
+                logger.debug(
+                    f"LSP {method} ok in {time.monotonic() - (deadline - timeout):.2f}s"
+                )
                 return message.get("result")
 
     # ---- 检索用三个能力 ----
@@ -249,7 +291,9 @@ class LSPClient:
         self._opened.add(uri)
 
     async def symbols(self, query: str, timeout: float = 90):
-        return await self._request("workspace/symbol", {"query": query}, timeout=timeout)
+        return await self._request(
+            "workspace/symbol", {"query": query}, timeout=timeout
+        )
 
     async def definition(self, path: str, line0: int, char: int):
         await self._ensure_open(path)
@@ -261,7 +305,9 @@ class LSPClient:
             },
         )
 
-    async def references(self, path: str, line0: int, char: int, include_decl: bool = False):
+    async def references(
+        self, path: str, line0: int, char: int, include_decl: bool = False
+    ):
         await self._ensure_open(path)
         return await self._request(
             "textDocument/references",
@@ -287,7 +333,9 @@ class LSPManager:
             self._locks[key] = asyncio.Lock()
         return self._locks[key]
 
-    async def get(self, root: str, ext: str, overrides: dict[str, list[list[str]]]) -> LSPClient:
+    async def get(
+        self, root: str, ext: str, overrides: dict[str, list[list[str]]]
+    ) -> LSPClient:
         key = (root, ext)
         async with self._lock_for(key):
             client = self._clients.get(key)

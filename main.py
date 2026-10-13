@@ -1,6 +1,4 @@
-"""白名单代码搜索插件：给 LLM 提供受目录白名单约束的搜索与读取工具。
-
-"""
+"""白名单代码搜索插件：给 LLM 提供受目录白名单约束的搜索与读取工具。"""
 
 from __future__ import annotations
 
@@ -20,18 +18,25 @@ from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
 
-from .lsp import LSPManager, SYMBOL_KINDS, guess_ext, parse_overrides, to_utf16_char, uri_to_path
+from .lsp import (
+    LSPManager,
+    SYMBOL_KINDS,
+    guess_ext,
+    parse_overrides,
+    to_utf16_char,
+    uri_to_path,
+)
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".idea", ".vs"}
 # frecency：访问一次 +1，按小时半衰（约 24h 衰减到 ~5%）
 FRECENCY_HALF_LIFE_HOURS = 24.0
-FRECENCY_HOT = 4.0   # >= 该分数标 [常看]
+FRECENCY_HOT = 4.0  # >= 该分数标 [常看]
 FRECENCY_WARM = 1.5  # >= 该分数标 [看过]
 # KV 容量护栏：不设上限会随搜索面无限增长
-FRECENCY_MAX_PER_SOURCE = 500   # 每个数据源最多记多少文件
-FRECENCY_MAX_SOURCES = 20       # 最多记多少个数据源桶
-FRECENCY_DROP_SCORE = 0.05      # 衰减到这个分数以下就删（约 5 天未访问）
-FRECENCY_MAX_TOTAL = 5000       # 全局条目硬上限
+FRECENCY_MAX_PER_SOURCE = 500  # 每个数据源最多记多少文件
+FRECENCY_MAX_SOURCES = 20  # 最多记多少个数据源桶
+FRECENCY_DROP_SCORE = 0.05  # 衰减到这个分数以下就删（约 5 天未访问）
+FRECENCY_MAX_TOTAL = 5000  # 全局条目硬上限
 MAX_SCAN_FILES = 20000
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_LINE_CHARS = 300
@@ -77,7 +82,7 @@ def _astrbot_whitelist_sources() -> dict[str, dict]:
 def _sources(config) -> dict[str, dict]:
     """合并数据源：template_list 条目 + AstrBot 白名单目录（include_astrbot 开关）。"""
     out: dict[str, dict] = {}
-    for item in (config.get("sources") or []):
+    for item in config.get("sources") or []:
         if not isinstance(item, dict):
             continue
         name = str(item.get("name", "")).strip()
@@ -143,12 +148,16 @@ def _gc_frecency(kv: dict, now: float | None = None) -> dict:
         if not kept:
             continue
         if len(kept) > FRECENCY_MAX_PER_SOURCE:
-            top = sorted(kept.items(), key=lambda kv2: -kv2[1]["s"])[:FRECENCY_MAX_PER_SOURCE]
+            top = sorted(kept.items(), key=lambda kv2: -kv2[1]["s"])[
+                :FRECENCY_MAX_PER_SOURCE
+            ]
             kept = dict(top)
         out[key] = kept
     # 源数超限：按总分排序，丢最冷的
     if len(out) > FRECENCY_MAX_SOURCES:
-        ranked = sorted(out.items(), key=lambda kv2: -sum(v["s"] for v in kv2[1].values()))
+        ranked = sorted(
+            out.items(), key=lambda kv2: -sum(v["s"] for v in kv2[1].values())
+        )
         out = dict(ranked[:FRECENCY_MAX_SOURCES])
     # 全局硬上限：再按分数截断
     total = sum(len(v) for v in out.values())
@@ -225,7 +234,9 @@ async def _lsp_client(plugin, kwargs, root: str, ext_hint: str | None = None):
         return _err("lsp_enabled 已关闭。")
     ext = str(kwargs.get("ext", "")).strip().lstrip(".").lower() or ext_hint
     if not ext:
-        return _err("无法判断语言（数据源里没有已知扩展名的文件），可用 ext 参数显式指定。")
+        return _err(
+            "无法判断语言（数据源里没有已知扩展名的文件），可用 ext 参数显式指定。"
+        )
     overrides = parse_overrides(plugin.config.get("lsp_servers"))
     try:
         return await plugin.lsp.get(root, ext, overrides)
@@ -272,7 +283,9 @@ def _pick_source(kwargs: dict, cfg: dict) -> tuple[str, str] | str:
     """返回 (名称, 根目录) 或错误信息字符串。"""
     sources = _sources(cfg)
     if not sources:
-        return _err("未配置数据源，请在插件配置「数据源白名单」里添加条目（名称 + 绝对路径）。")
+        return _err(
+            "未配置数据源，请在插件配置「数据源白名单」里添加条目（名称 + 绝对路径）。"
+        )
     src = str(kwargs.get("source", "")).strip()
     if src not in sources:
         listing = "、".join(
@@ -282,7 +295,9 @@ def _pick_source(kwargs: dict, cfg: dict) -> tuple[str, str] | str:
         return _err(f"未知数据源 {src!r}，可用：{listing}")
     root = sources[src]["path"]
     if not os.path.isdir(root):
-        logger.warning(f"self file search: data source {src!r} path does not exist: {root}")
+        logger.warning(
+            f"self file search: data source {src!r} path does not exist: {root}"
+        )
         return _err(f"数据源目录不存在：{root}")
     return src, root
 
@@ -329,53 +344,55 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         "and offset paging. Ideal for locating code by class name, function name, "
         "identifier or error message."
     )
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "source": {
-                "type": "string",
-                "description": "Data source name",
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Data source name",
+                },
+                "pattern": {
+                    "type": "string",
+                    "description": "Text or regex to search for",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["content", "files", "count"],
+                    "description": "content = hit lines (default); files = matching paths only; count = per-file hit counts",
+                },
+                "file_glob": {
+                    "type": "string",
+                    "description": "Optional filename glob filter, e.g. *.cs; default all files",
+                },
+                "exclude_glob": {
+                    "type": "string",
+                    "description": "Optional globs to skip, comma-separated, e.g. '*.Designer.cs, generated/*'; leading ! tolerated",
+                },
+                "is_regex": {
+                    "type": "boolean",
+                    "description": "Whether pattern is parsed as regex; default false (plain text)",
+                },
+                "case_sensitive": {
+                    "type": "boolean",
+                    "description": "Case-sensitive matching; default false",
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Optional N lines before/after each hit (content mode only); default 0",
+                },
+                "max_matches": {
+                    "type": "integer",
+                    "description": "Max entries returned (content=hit lines, files/count=files); default 40",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Optional; skip the first N entries (paging); default 0",
+                },
             },
-            "pattern": {
-                "type": "string",
-                "description": "Text or regex to search for",
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["content", "files", "count"],
-                "description": "content = hit lines (default); files = matching paths only; count = per-file hit counts",
-            },
-            "file_glob": {
-                "type": "string",
-                "description": "Optional filename glob filter, e.g. *.cs; default all files",
-            },
-            "exclude_glob": {
-                "type": "string",
-                "description": "Optional globs to skip, comma-separated, e.g. '*.Designer.cs, generated/*'; leading ! tolerated",
-            },
-            "is_regex": {
-                "type": "boolean",
-                "description": "Whether pattern is parsed as regex; default false (plain text)",
-            },
-            "case_sensitive": {
-                "type": "boolean",
-                "description": "Case-sensitive matching; default false",
-            },
-            "context_lines": {
-                "type": "integer",
-                "description": "Optional N lines before/after each hit (content mode only); default 0",
-            },
-            "max_matches": {
-                "type": "integer",
-                "description": "Max entries returned (content=hit lines, files/count=files); default 40",
-            },
-            "offset": {
-                "type": "integer",
-                "description": "Optional; skip the first N entries (paging); default 0",
-            },
-        },
-        "required": ["source", "pattern"],
-    })
+            "required": ["source", "pattern"],
+        }
+    )
     plugin_ref: Any = None
 
     async def call(
@@ -403,7 +420,11 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             return _err(f"正则无效：{exc}")
         limit = max(1, min(int(kwargs.get("max_matches", 40) or 40), 200))
         offset = max(0, int(kwargs.get("offset", 0) or 0))
-        ctx_lines = max(0, min(int(kwargs.get("context_lines", 0) or 0), 10)) if mode == "content" else 0
+        ctx_lines = (
+            max(0, min(int(kwargs.get("context_lines", 0) or 0), 10))
+            if mode == "content"
+            else 0
+        )
         glob = str(kwargs.get("file_glob", "")).strip() or "*"
         exclude = _parse_excludes(kwargs.get("exclude_glob"))
 
@@ -422,7 +443,10 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                     break
                 if not fnmatch(fn, glob):
                     continue
-                if exclude and _is_excluded(os.path.relpath(os.path.join(dirpath, fn), root).replace("\\", "/"), exclude):
+                if exclude and _is_excluded(
+                    os.path.relpath(os.path.join(dirpath, fn), root).replace("\\", "/"),
+                    exclude,
+                ):
                     continue
                 path = os.path.join(dirpath, fn)
                 try:
@@ -458,17 +482,21 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             entries = [
                 f"{rel}（{len(matches[rel])} 处）{self._frecency_tag(src, rel)}"
                 for rel in order
-            ][offset:offset + limit]
+            ][offset : offset + limit]
             head += f"，命中文件 {len(order)} 个"
             if self.plugin_ref and self.plugin_ref.kv_ready:
                 head += "（按访问频率排序）"
             # 记一次访问（异步落盘，不阻塞返回）
-            self._bump(src, order[offset:offset + limit])
+            self._bump(src, order[offset : offset + limit])
         elif mode == "count":
-            entries = [f"{rel}: {len(matches[rel])}" for rel in order][offset:offset + limit]
+            entries = [f"{rel}: {len(matches[rel])}" for rel in order][
+                offset : offset + limit
+            ]
             head += f"，命中文件 {len(order)} 个，共 {total} 处"
         else:
-            rendered = self._render_content(root, order, matches, ctx_lines, limit, offset)
+            rendered = self._render_content(
+                root, order, matches, ctx_lines, limit, offset
+            )
             entries = rendered
             head += f"，命中 {total} 行"
         if incomplete:
@@ -486,8 +514,18 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         body = "\n".join(entries)
         if len(head) + len(body) > SEARCH_OUTPUT_CAP:
             shown = len(entries)
-            next_hint = ("本次已输出 " + str(shown) + " 条：翻页用 offset=" + str(offset + shown) + " 继续，或用 file_glob 收窄、max_matches 调小后重搜。")
-            body = body[: SEARCH_OUTPUT_CAP - len(head)] + "\n…（输出超限截断）" + next_hint
+            next_hint = (
+                "本次已输出 "
+                + str(shown)
+                + " 条：翻页用 offset="
+                + str(offset + shown)
+                + " 继续，或用 file_glob 收窄、max_matches 调小后重搜。"
+            )
+            body = (
+                body[: SEARCH_OUTPUT_CAP - len(head)]
+                + "\n…（输出超限截断）"
+                + next_hint
+            )
         return head + "\n" + body
 
     def _score(self, src: str, rel: str) -> float:
@@ -581,46 +619,60 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
         "output budget; per-file problems are reported inline. Omit files to read "
         "a single path."
     )
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "source": {
-                "type": "string",
-                "description": "Data source name",
-            },
-            "path": {
-                "type": "string",
-                "description": "Relative path inside the data source (single-file form)",
-            },
-            "files": {
-                "type": "array",
-                "description": "Batch-read up to 8 files; mutually exclusive with path",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "Relative path inside the data source"},
-                        "start_line": {"type": "integer", "description": "1-based start line"},
-                        "end_line": {"type": "integer", "description": "Optional 1-based inclusive end line; negative counts from the end (-1 = last line)"},
-                        "max_chars": {"type": "integer", "description": "Max characters returned for this file"},
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "Data source name",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Relative path inside the data source (single-file form)",
+                },
+                "files": {
+                    "type": "array",
+                    "description": "Batch-read up to 8 files; mutually exclusive with path",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Relative path inside the data source",
+                            },
+                            "start_line": {
+                                "type": "integer",
+                                "description": "1-based start line",
+                            },
+                            "end_line": {
+                                "type": "integer",
+                                "description": "Optional 1-based inclusive end line; negative counts from the end (-1 = last line)",
+                            },
+                            "max_chars": {
+                                "type": "integer",
+                                "description": "Max characters returned for this file",
+                            },
+                        },
+                        "required": ["path"],
                     },
-                    "required": ["path"],
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "Optional 1-based start line; default 1",
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "Optional 1-based inclusive end line; negative counts from the end (-1 = last line)",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Optional max characters returned; default 8000",
                 },
             },
-            "start_line": {
-                "type": "integer",
-                "description": "Optional 1-based start line; default 1",
-            },
-            "end_line": {
-                "type": "integer",
-                "description": "Optional 1-based inclusive end line; negative counts from the end (-1 = last line)",
-            },
-            "max_chars": {
-                "type": "integer",
-                "description": "Optional max characters returned; default 8000",
-            },
-        },
-        "required": ["source"],
-    })
+            "required": ["source"],
+        }
+    )
     plugin_ref: Any = None
 
     async def call(
@@ -634,25 +686,36 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
 
         files = kwargs.get("files")
         if files:
-            if not isinstance(files, list) or not all(isinstance(x, dict) for x in files):
+            if not isinstance(files, list) or not all(
+                isinstance(x, dict) for x in files
+            ):
                 return _err("files 必须是对象数组，每项至少含 path。")
             if len(files) > 8:
                 return _err("files 一次最多 8 个文件，分多次调用。")
-            default_chars = min(int(kwargs.get("max_chars", 8000) or 8000),
-                                int(cfg.get("max_read_chars", 32000) or 32000))
+            default_chars = min(
+                int(kwargs.get("max_chars", 8000) or 8000),
+                int(cfg.get("max_read_chars", 32000) or 32000),
+            )
             blocks: list[str] = []
             truncated = False
             for idx, entry in enumerate(files, 1):
                 head, body, more = self._read_entry(root, entry, default_chars)
                 tag = "" if not more else "，未完可续读"
-                blocks.append(f"[{idx}/{len(files)}] {head}{tag}\n{body}" if body else f"[{idx}/{len(files)}] {head}")
+                blocks.append(
+                    f"[{idx}/{len(files)}] {head}{tag}\n{body}"
+                    if body
+                    else f"[{idx}/{len(files)}] {head}"
+                )
                 if more:
                     truncated = True
             text = f"[{src}] 批量读取 {len(files)} 个文件\n" + "\n".join(blocks)
             if truncated:
-                text += "\n（Partial：有文件未显示完整，按各文件头提示的 start_line 续读）"
+                text += (
+                    "\n（Partial：有文件未显示完整，按各文件头提示的 start_line 续读）"
+                )
             return _limit(
-                text, SEARCH_OUTPUT_CAP,
+                text,
+                SEARCH_OUTPUT_CAP,
                 "输出超限：改小各文件的 max_chars，或拆成两次调用分批读"
                 "（各文件头已注明还剩多少行未读）。",
             )
@@ -661,19 +724,31 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
         if not rel:
             return _err("请提供 path 或 files。")
         head, body, more = self._read_entry(
-            root, {"path": rel,
-                   "start_line": kwargs.get("start_line"),
-                   "end_line": kwargs.get("end_line"),
-                   "max_chars": kwargs.get("max_chars")},
-            min(int(kwargs.get("max_chars", 8000) or 8000),
-                int(cfg.get("max_read_chars", 32000) or 32000)),
+            root,
+            {
+                "path": rel,
+                "start_line": kwargs.get("start_line"),
+                "end_line": kwargs.get("end_line"),
+                "max_chars": kwargs.get("max_chars"),
+            },
+            min(
+                int(kwargs.get("max_chars", 8000) or 8000),
+                int(cfg.get("max_read_chars", 32000) or 32000),
+            ),
         )
         text = f"{head}\n{body}" if body else head
         if more:
             # 续读提示放正文末尾：模型读到结尾才需要知道下一步
             mm = re.search(r"显示 (\d+)-(\d+) 行", head)
-            tip = ("\n（Partial：未显示完整，用 start_line=" + str(int(mm.group(2)) + 1)
-                   + " 继续读）") if mm else "\n（Partial：未显示完整，用 start_line 指定起点继续读）"
+            tip = (
+                (
+                    "\n（Partial：未显示完整，用 start_line="
+                    + str(int(mm.group(2)) + 1)
+                    + " 继续读）"
+                )
+                if mm
+                else "\n（Partial：未显示完整，用 start_line 指定起点继续读）"
+            )
             text += tip
         m = re.search(r"显示 (\d+)-(\d+) 行", head)
         mtotal = re.search(r"共 (\d+) 行", head)
@@ -685,14 +760,23 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
             nxt = last + 1
             next_hint = (
                 "输出超限：改用 start_line=" + str(nxt) + " 继续读"
-                "（读到底 start_line=" + str(nxt) + "&end_line=" + str(total_hint) +
-                "；只读一页 start_line=" + str(nxt) + "&end_line=" + str(min(total_hint, last + page_size)) + "）。"
+                "（读到底 start_line="
+                + str(nxt)
+                + "&end_line="
+                + str(total_hint)
+                + "；只读一页 start_line="
+                + str(nxt)
+                + "&end_line="
+                + str(min(total_hint, last + page_size))
+                + "）。"
             )
         else:
             next_hint = "输出超限：用 start_line 指定起点继续读。"
         return _limit(f"{_stamp(root)}[{src}] " + text, SEARCH_OUTPUT_CAP, next_hint)
 
-    def _read_entry(self, root: str, entry: dict, default_chars: int) -> tuple[str, str, bool]:
+    def _read_entry(
+        self, root: str, entry: dict, default_chars: int
+    ) -> tuple[str, str, bool]:
         """读单个条目，返回 (头信息, 正文, 是否还有剩余)。"""
         rel = str(entry.get("path", "")).strip()
         abs_path = _contain(root, rel)
@@ -700,7 +784,9 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
             return f"{rel}: 路径越界或非法", "", False
         if not os.path.isfile(abs_path):
             return f"{rel}: 文件不存在", "", False
-        max_chars = min(int(entry.get("max_chars", default_chars) or default_chars), default_chars)
+        max_chars = min(
+            int(entry.get("max_chars", default_chars) or default_chars), default_chars
+        )
         start = max(1, int(entry.get("start_line", 1) or 1))
         try:
             with open(abs_path, encoding="utf-8", errors="replace") as f:
@@ -755,18 +841,23 @@ class SelfGlobTool(FunctionTool[AstrAgentContext]):
         "Card*.cs, *Trait*). Use it to confirm a path when you know the filename or "
         "to browse structure; use self_search to find code by content."
     )
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "source": {"type": "string", "description": "Data source name"},
-            "pattern": {
-                "type": "string",
-                "description": "Filename glob, e.g. *.cs; default * (all files)",
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Data source name"},
+                "pattern": {
+                    "type": "string",
+                    "description": "Filename glob, e.g. *.cs; default * (all files)",
+                },
+                "max": {
+                    "type": "integer",
+                    "description": "Max entries returned; default 100",
+                },
             },
-            "max": {"type": "integer", "description": "Max entries returned; default 100"},
-        },
-        "required": ["source"],
-    })
+            "required": ["source"],
+        }
+    )
     plugin_ref: Any = None
 
     async def call(
@@ -813,7 +904,8 @@ class SelfGlobTool(FunctionTool[AstrAgentContext]):
                 f"建议收窄 pattern，如加前缀）"
             )
         return _limit(
-            head + "\n" + body, SEARCH_OUTPUT_CAP,
+            head + "\n" + body,
+            SEARCH_OUTPUT_CAP,
             "输出超限：收窄 pattern（如加前缀 Card*）后重列。",
         )
 
@@ -827,16 +919,27 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
         "server for the language on PATH; on first call the server may still be "
         "indexing, so retry if the result is empty."
     )
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "source": {"type": "string", "description": "Data source name"},
-            "query": {"type": "string", "description": "Symbol name or a part of it, e.g. ThrowMethod"},
-            "ext": {"type": "string", "description": "Optional language extension (e.g. cs); auto-detected from the source by default"},
-            "max": {"type": "integer", "description": "Max entries returned; default 30"},
-        },
-        "required": ["source", "query"],
-    })
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Data source name"},
+                "query": {
+                    "type": "string",
+                    "description": "Symbol name or a part of it, e.g. ThrowMethod",
+                },
+                "ext": {
+                    "type": "string",
+                    "description": "Optional language extension (e.g. cs); auto-detected from the source by default",
+                },
+                "max": {
+                    "type": "integer",
+                    "description": "Max entries returned; default 30",
+                },
+            },
+            "required": ["source", "query"],
+        }
+    )
     plugin_ref: Any = None
 
     async def call(
@@ -849,7 +952,9 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
         src, root = picked
         if not self.plugin_ref._lsp_ext_cache.get(root):
             self.plugin_ref._lsp_ext_cache[root] = guess_ext(root)
-        client = await _lsp_client(self.plugin_ref, kwargs, root, self.plugin_ref._lsp_ext_cache.get(root))
+        client = await _lsp_client(
+            self.plugin_ref, kwargs, root, self.plugin_ref._lsp_ext_cache.get(root)
+        )
         if isinstance(client, str):
             return client
         query = str(kwargs.get("query", "")).strip()
@@ -885,18 +990,35 @@ class SelfRefsTool(FunctionTool[AstrAgentContext]):
         "by the language server, cross-file). path/line come from self_search or "
         "self_symbols hits; symbol defaults to the first identifier on that line."
     )
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "source": {"type": "string", "description": "Data source name"},
-            "path": {"type": "string", "description": "Relative path inside the data source"},
-            "line": {"type": "integer", "description": "1-based line number where the symbol appears"},
-            "symbol": {"type": "string", "description": "Optional symbol to query; defaults to the first identifier on that line"},
-            "ext": {"type": "string", "description": "Optional language extension (e.g. cs)"},
-            "max": {"type": "integer", "description": "Max entries returned; default 50"},
-        },
-        "required": ["source", "path", "line"],
-    })
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Data source name"},
+                "path": {
+                    "type": "string",
+                    "description": "Relative path inside the data source",
+                },
+                "line": {
+                    "type": "integer",
+                    "description": "1-based line number where the symbol appears",
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Optional symbol to query; defaults to the first identifier on that line",
+                },
+                "ext": {
+                    "type": "string",
+                    "description": "Optional language extension (e.g. cs)",
+                },
+                "max": {
+                    "type": "integer",
+                    "description": "Max entries returned; default 50",
+                },
+            },
+            "required": ["source", "path", "line"],
+        }
+    )
     plugin_ref: Any = None
 
     async def call(
@@ -922,7 +1044,7 @@ class SelfRefsTool(FunctionTool[AstrAgentContext]):
             return _err(f"{rel} 第 {line1} 行不存在或为空。")
         located = _locate(line_text, str(kwargs.get("symbol", "")).strip() or None)
         if located is None:
-            return _err(f"该行找不到可定位的标识符，请用 symbol 参数指明。")
+            return _err("该行找不到可定位的标识符，请用 symbol 参数指明。")
         symbol, col = located
         if not self.plugin_ref._lsp_ext_cache.get(root):
             self.plugin_ref._lsp_ext_cache[root] = guess_ext(root)
@@ -936,7 +1058,9 @@ class SelfRefsTool(FunctionTool[AstrAgentContext]):
         root_real = os.path.realpath(root)
         try:
             if mode == "refs":
-                result = await client.references(abs_path, line1 - 1, char, include_decl=True)
+                result = await client.references(
+                    abs_path, line1 - 1, char, include_decl=True
+                )
             else:
                 result = await client.definition(abs_path, line1 - 1, char)
         except Exception as exc:
@@ -946,7 +1070,8 @@ class SelfRefsTool(FunctionTool[AstrAgentContext]):
         if not body:
             return head + " 无结果（若服务器刚启动，可稍后重试）。"
         return _limit(
-            head + "\n" + body, SEARCH_OUTPUT_CAP,
+            head + "\n" + body,
+            SEARCH_OUTPUT_CAP,
             "输出超限：调小 max 只看前几条，或换个更具体的 symbol 重查。",
         )
 
@@ -959,17 +1084,31 @@ class SelfDefTool(FunctionTool[AstrAgentContext]):
         "cross-file). path/line point at a usage; symbol defaults to the first "
         "identifier on that line."
     )
-    parameters: dict = Field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "source": {"type": "string", "description": "Data source name"},
-            "path": {"type": "string", "description": "Relative path inside the data source"},
-            "line": {"type": "integer", "description": "1-based line number where the symbol appears"},
-            "symbol": {"type": "string", "description": "Optional symbol to jump to; defaults to the first identifier on that line"},
-            "ext": {"type": "string", "description": "Optional language extension (e.g. cs)"},
-        },
-        "required": ["source", "path", "line"],
-    })
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "Data source name"},
+                "path": {
+                    "type": "string",
+                    "description": "Relative path inside the data source",
+                },
+                "line": {
+                    "type": "integer",
+                    "description": "1-based line number where the symbol appears",
+                },
+                "symbol": {
+                    "type": "string",
+                    "description": "Optional symbol to jump to; defaults to the first identifier on that line",
+                },
+                "ext": {
+                    "type": "string",
+                    "description": "Optional language extension (e.g. cs)",
+                },
+            },
+            "required": ["source", "path", "line"],
+        }
+    )
     plugin_ref: Any = None
 
     async def call(
@@ -1006,7 +1145,9 @@ class SelfFileSearchPlugin(star.Star):
         if not sources:
             # 全部数据源停用（含 AstrBot 白名单开关）时不注册工具，
             # 免得机器人面对五个永远报错的工具白白耗上下文。
-            logger.info("astrbot_plugin_self_file_search: no enabled data source, tools not registered")
+            logger.info(
+                "astrbot_plugin_self_file_search: no enabled data source, tools not registered"
+            )
             return
         logger.debug(f"self file search: enabled sources: {sorted(sources)}")
         context.add_llm_tools(
@@ -1017,7 +1158,9 @@ class SelfFileSearchPlugin(star.Star):
             SelfRefsTool(plugin_ref=self),
             SelfDefTool(plugin_ref=self),
         )
-        logger.info("astrbot_plugin_self_file_search: self_search/self_read/self_glob/self_symbols/self_refs/self_def registered")
+        logger.info(
+            "astrbot_plugin_self_file_search: self_search/self_read/self_glob/self_symbols/self_refs/self_def registered"
+        )
 
     async def _load_kv(self) -> None:
         try:
