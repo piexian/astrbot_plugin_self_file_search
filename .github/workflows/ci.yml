@@ -41,7 +41,7 @@ jobs:
       - name: Run ruff lint
         # 规则集与 AstrBot 本体 pyproject.toml 的 [tool.ruff] 保持一致，
         # 显式声明以免依赖 ruff 版本默认值。
-        # E501（行长）与 ASYNC230/240 沿用本体的 ignore。
+        # E501（行长）与 ASYNC230/240 沿用本体的 ignore；ASYNC109 同理——timeout 是对外参数，不改签名。
         run: |
           ruff check \
             --select F,W,E,ASYNC,C4,Q,I,UP \
