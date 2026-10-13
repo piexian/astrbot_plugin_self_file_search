@@ -39,7 +39,14 @@ jobs:
         run: pip install ruff
 
       - name: Run ruff lint
-        run: ruff check .
+        # 显式声明规则集，不依赖 ruff 版本的默认值；与本地全局配置保持一致。
+        # RUF001/002/003 忽略：中文注释与字符串的全角标点会误报。
+        # ARG002 忽略：FunctionTool.call(self, context, ...) 的 context 是框架签名。
+        run: |
+          ruff check \
+            --select E,W,F,I,S,BLE,ASYNC,B,RUF,C4,RET,SIM,ARG,UP \
+            --ignore RUF001,RUF002,RUF003,ARG002,UP006,UP035 \
+            --line-length 120 .
 
   metadata:
     name: Plugin Metadata
