@@ -2,6 +2,10 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.0.3] - 2026-10-13
+
+- 修正插件元数据字段名以符合 AstrBot 规范（`description` → `desc`，`repository` → `repo`），补充 `short_desc` 与 `astrbot_version`。
+
 ## [1.0.2] - 2026-10-13
 
 - 搜索支持排除模式，命中文件按访问频率排序。
