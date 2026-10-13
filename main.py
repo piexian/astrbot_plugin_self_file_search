@@ -10,17 +10,16 @@ import time
 from fnmatch import fnmatch
 from typing import Any
 
-from pydantic import Field
-from pydantic.dataclasses import dataclass
-
 from astrbot.api import AstrBotConfig, logger, star
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.agent.tool import FunctionTool, ToolExecResult
 from astrbot.core.astr_agent_context import AstrAgentContext
+from pydantic import Field
+from pydantic.dataclasses import dataclass
 
 from .lsp import (
-    LSPManager,
     SYMBOL_KINDS,
+    LSPManager,
     guess_ext,
     parse_overrides,
     to_utf16_char,
@@ -369,7 +368,10 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 "mode": {
                     "type": "string",
                     "enum": ["content", "files", "count"],
-                    "description": "content = hit lines (default); files = matching paths only; count = per-file hit counts",
+                    "description": (
+                        "content = hit lines (default); files = matching paths only; "
+                        "count = per-file hit counts"
+                    ),
                 },
                 "file_glob": {
                     "type": "string",
@@ -377,7 +379,10 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 },
                 "exclude_glob": {
                     "type": "string",
-                    "description": "Optional globs to skip, comma-separated, e.g. '*.Designer.cs, generated/*'; leading ! tolerated",
+                    "description": (
+                        "Optional globs to skip, comma-separated, "
+                        "e.g. '*.Designer.cs, generated/*'; leading ! tolerated"
+                    ),
                 },
                 "is_regex": {
                     "type": "boolean",
@@ -518,7 +523,10 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             remain = max(0, len(order) - offset - len(entries))
         if remain:
             pages = max(1, -(-remain // max(limit, 1)))
-            head += f"；还剩 {remain} 条未显示，按 max_matches={limit} 估计还需 {pages} 页（offset={offset + len(entries)} 起）"
+            head += (
+                f"；还剩 {remain} 条未显示，按 max_matches={limit} 估计还需 {pages} 页"
+                f"（offset={offset + len(entries)} 起）"
+            )
         if not entries:
             return f"{head}，无可命中内容。"
         body = "\n".join(entries)
@@ -560,7 +568,11 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         if not (plugin and plugin.kv_ready) or not rels:
             return
         _frecency_bump(plugin, src, rels)  # 内部会跑 GC 控制体积
-        asyncio.create_task(plugin._save_kv(src, plugin.kv.get(_frecency_key(src), {})))
+        task = asyncio.create_task(
+            plugin._save_kv(src, plugin.kv.get(_frecency_key(src), {}))
+        )
+        plugin._kv_tasks.add(task)
+        task.add_done_callback(plugin._kv_tasks.discard)
 
     @staticmethod
     def _render_content(root, order, matches, ctx_lines, limit, offset) -> list[str]:
@@ -657,7 +669,10 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
                             },
                             "end_line": {
                                 "type": "integer",
-                                "description": "Optional 1-based inclusive end line; negative counts from the end (-1 = last line)",
+                                "description": (
+                                    "Optional 1-based inclusive end line; "
+                                    "negative counts from the end (-1 = last line)"
+                                ),
                             },
                             "max_chars": {
                                 "type": "integer",
@@ -1149,6 +1164,7 @@ class SelfFileSearchPlugin(star.Star):
         self.kv: dict = {}
         self.kv_ready = False
         self._kv_task = None
+        self._kv_tasks: set = set()  # 持有异步落盘任务引用，防止被 GC 提前回收
         if config.get("frecency_enabled", True):
             self._kv_task = asyncio.create_task(self._load_kv())
         sources = _sources(config)
@@ -1169,7 +1185,8 @@ class SelfFileSearchPlugin(star.Star):
             SelfDefTool(plugin_ref=self),
         )
         logger.info(
-            "astrbot_plugin_self_file_search: self_search/self_read/self_glob/self_symbols/self_refs/self_def registered"
+            "astrbot_plugin_self_file_search: registered "
+            "self_search/self_read/self_glob/self_symbols/self_refs/self_def"
         )
 
     async def _load_kv(self) -> None:
@@ -1206,6 +1223,9 @@ class SelfFileSearchPlugin(star.Star):
     async def terminate(self) -> None:
         if self._kv_task and not self._kv_task.done():
             self._kv_task.cancel()
+        for t in list(self._kv_tasks):
+            t.cancel()
+        self._kv_tasks.clear()
         # 插件卸载/停用时清掉自己的 KV，不给 AstrBot 本体留垃圾
         try:
             await self.delete_kv_data("frecency")
