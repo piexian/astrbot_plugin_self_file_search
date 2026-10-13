@@ -33,7 +33,7 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 
 ## 工具列表
 
-### 文本级（永远可用）
+### 文本级
 
 | 工具 | 功能 |
 |------|------|
@@ -68,7 +68,6 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 - **LSP 二次校验**：语言服务器返回的位置再过一次根目录包含检查
 - **注册门控**：全部数据源停用（含 AstrBot 白名单开关）时不注册任何工具
 - **schema 可移植子集**：工具参数 schema 只用各 LLM provider 都接受的交集（标量 type、无 `$ref`/`anyOf`/`format`），避免一条被拒导致整个请求 400
-- **KV 不无限增长**：frecency 存在 AstrBot 插件 KV 里，带自动淘汰（每源 500 条 / 最多 20 个源 / 全局 5000 条硬上限 / 约 5 天未访问自动删）；插件卸载或停用时随 `terminate` 全部清空
 
 ## 配置
 
@@ -93,19 +92,17 @@ astrbot_plugin_self_file_search/
 ├── lsp.py                           # 通用 LSP 后端：探测表 / 进程管理 / JSON-RPC
 ├── metadata.yaml                    # 插件元数据
 ├── _conf_schema.json                # 插件配置 Schema
+├── CHANGELOG.md
 └── README.md
 ```
 
-## 借鉴来源
-
-- [fastctx](https://github.com/yc-duan/fastctx)：grep 多输出模式、批量 read 与 Partial 续读、schema 可移植子集铁律。
-- [fff](https://github.com/dmtrKovalenko/fff) / `pi-fff`：frecency 排序、`exclude` 排除语法、按查询长度缩放的弱匹配阈值思路。
 
 ## 相关链接
 
 - [AstrBot 文档](https://docs.astrbot.app/)
 - [插件开发文档](https://docs.astrbot.app/dev/star/plugin-new.html)
 - [fastctx](https://github.com/yc-duan/fastctx) —— 接口设计借鉴来源
+- [fff](https://github.com/dmtrKovalenko/fff) —— 排序、排除语法、按查询长度缩放的弱匹配阈值思路。
 - [Issues](https://github.com/piexian/astrbot_plugin_self_file_search/issues)
 
 <div align="center">
