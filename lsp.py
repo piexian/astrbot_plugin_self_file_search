@@ -199,8 +199,8 @@ class LSPClient:
                 self._send_raw("exit", None, is_notify=True)
                 await asyncio.wait_for(proc.wait(), timeout=3)
                 return
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - 关闭阶段任何失败都要兜住并继续 kill
+                logger.debug(f"LSP graceful shutdown failed, killing: {exc}")
             try:
                 proc.kill()
             except ProcessLookupError:
@@ -274,8 +274,13 @@ class LSPClient:
         uri = _path_to_uri(path)
         if uri in self._opened:
             return
-        with open(path, encoding="utf-8", errors="replace") as f:
-            text = f.read()
+
+        # 异步上下文里不用阻塞 open：丢到线程读，避免大文件卡住事件循环
+        def _read() -> str:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return f.read()
+
+        text = await asyncio.to_thread(_read)
         ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
         await self._notify(
             "textDocument/didOpen",
@@ -369,8 +374,8 @@ class LSPManager:
                     self._clients.pop(key, None)
                     try:
                         await client.stop()
-                    except Exception:
-                        pass
+                    except Exception as exc:  # noqa: BLE001 - 回收阶段兜住，不影响其他客户端
+                        logger.debug(f"LSP idle close failed: {exc}")
 
     async def shutdown(self) -> None:
         if self._reaper:
@@ -378,6 +383,6 @@ class LSPManager:
         for client in list(self._clients.values()):
             try:
                 await client.stop()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - 卸载阶段兜住，保证全部清理
+                logger.debug(f"LSP shutdown failed: {exc}")
         self._clients.clear()
