@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -111,7 +112,7 @@ def probe(
 def guess_ext(root: str) -> str | None:
     """数据源目录里数量最多的已知扩展名。"""
     counts: dict[str, int] = {}
-    for dirpath, dirnames, filenames in os.walk(root):
+    for _dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for fn in filenames:
             ext = fn.rsplit(".", 1)[-1].lower() if "." in fn else ""
@@ -201,10 +202,8 @@ class LSPClient:
                 return
             except Exception as exc:  # noqa: BLE001 - 关闭阶段任何失败都要兜住并继续 kill
                 logger.debug(f"LSP graceful shutdown failed, killing: {exc}")
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 proc.kill()
-            except ProcessLookupError:
-                pass
 
     # ---- 协议底层 ----
 
@@ -347,8 +346,9 @@ class LSPManager:
             if client and client.proc and client.proc.returncode is None:
                 return client
             if client is not None:
+                code = client.proc.returncode if client.proc else "none"
                 logger.warning(
-                    f"LSP process died (code={client.proc.returncode if client.proc else 'none'}), respawning: {ext} @ {root}"
+                    f"LSP process died (code={code}), respawning: {ext} @ {root}"
                 )
             argv, tried = probe(ext, overrides)
             if argv is None:
