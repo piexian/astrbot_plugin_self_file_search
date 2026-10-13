@@ -5,6 +5,7 @@
 ## [1.0.3] - 2026-10-13
 
 - 修正插件元数据字段名以符合 AstrBot 规范（`description` → `desc`，`repository` → `repo`），补充 `short_desc` 与 `astrbot_version`。
+- 新增 CI：ruff 格式与静态检查、插件元数据校验，规则集与 AstrBot 本体保持一致。
 
 ## [1.0.2] - 2026-10-13
 
