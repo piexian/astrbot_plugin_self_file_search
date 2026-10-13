@@ -344,6 +344,14 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             head += f"，命中 {total} 行"
         if incomplete:
             head += "（达到上限或扫描超时，结果可能不全，可缩小 pattern 或加 file_glob 再搜）"
+        # 剩余条数 + 预估页数：让模型知道还有多少、要读几页
+        if mode == "content":
+            remain = max(0, total - offset - len(entries))
+        else:
+            remain = max(0, len(order) - offset - len(entries))
+        if remain:
+            pages = max(1, -(-remain // max(limit, 1)))
+            head += f"；还剩 {remain} 条未显示，按 max_matches={limit} 估计还需 {pages} 页（offset={offset + len(entries)} 起）"
         if not entries:
             return f"{head}，无可命中内容。"
         body = "\n".join(entries)
@@ -492,7 +500,8 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
                 text += "\n（Partial：有文件未显示完整，按各文件头提示的 start_line 续读）"
             return _limit(
                 text, SEARCH_OUTPUT_CAP,
-                "输出超限：改小各文件的 max_chars，或拆成两次调用分批读。",
+                "输出超限：改小各文件的 max_chars，或拆成两次调用分批读"
+                "（各文件头已注明还剩多少行未读）。",
             )
 
         rel = str(kwargs.get("path", "")).strip()
@@ -560,7 +569,14 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
         end = s + len(out) - 1
         head = f"{rel}（共 {total} 行，显示 {s}-{end} 行）"
         if end < total:
-            head += f"，后续 {total - end} 行未显示，可 start_line={end + 1} 续读（或 start_line={end + 1}&end_line=... 指定区间）"
+            left_lines = total - end
+            left_chars = sum(len(x) for x in lines[end:])
+            pages = max(1, -(-left_chars // max(max_chars, 1)))
+            head += (
+                f"，还剩 {left_lines} 行未读（约 {left_chars} 字符，按当前 max_chars"
+                f" 估计还需 {pages} 次），用 start_line={end + 1} 续读"
+                f"（或 start_line={end + 1}&end_line=... 指定区间）"
+            )
             return head, "".join(out), True
         return head, "".join(out), False
 
@@ -624,7 +640,12 @@ class SelfGlobTool(FunctionTool[AstrAgentContext]):
             return f"{head}，无匹配文件。"
         body = "\n".join(shown)
         if total > len(shown):
-            body += f"\n…（其余 {total - len(shown)} 个未显示，可收窄 pattern）"
+            rest = total - len(shown)
+            pages = max(1, -(-rest // max(limit, 1)))
+            body += (
+                f"\n…（其余 {rest} 个未显示，按 max={limit} 估计还需 {pages} 页；"
+                f"建议收窄 pattern，如加前缀）"
+            )
         return _limit(
             head + "\n" + body, SEARCH_OUTPUT_CAP,
             "输出超限：收窄 pattern（如加前缀 Card*）后重列。",
