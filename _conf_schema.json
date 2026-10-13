@@ -69,6 +69,6 @@
     "description": "启用访问频率排序（frecency）",
     "type": "bool",
     "default": true,
-    "hint": "self_search 的 files 模式按「访问频率 + 时间衰减」排序，常查的文件排前面并标注 [常看]/[看过]。数据存在 AstrBot 自带的插件 KV 存储里，不写本地文件。"
+    "hint": "self_search 的 files 模式按「访问频率 + 时间衰减」排序，常查的文件排前面并标注常看/看过。数据存在 AstrBot 自带插件 KV 里，不写本地文件；自动淘汰（每源 500 条、源数 20、全局 5000、约 5 天未访问自动删），插件卸载/停用时随 terminate 清空，不会无限增长。"
   }
 }

@@ -27,6 +27,11 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".idea", ".
 FRECENCY_HALF_LIFE_HOURS = 24.0
 FRECENCY_HOT = 4.0   # >= 该分数标 [常看]
 FRECENCY_WARM = 1.5  # >= 该分数标 [看过]
+# KV 容量护栏：不设上限会随搜索面无限增长
+FRECENCY_MAX_PER_SOURCE = 500   # 每个数据源最多记多少文件
+FRECENCY_MAX_SOURCES = 20       # 最多记多少个数据源桶
+FRECENCY_DROP_SCORE = 0.05      # 衰减到这个分数以下就删（约 5 天未访问）
+FRECENCY_MAX_TOTAL = 5000       # 全局条目硬上限
 MAX_SCAN_FILES = 20000
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_LINE_CHARS = 300
@@ -118,8 +123,47 @@ def _frecency_load(plugin, src: str) -> dict:
     return {k: [v.get("s", 0.0), v.get("t", 0.0)] for k, v in (raw or {}).items()}
 
 
+def _gc_frecency(kv: dict, now: float | None = None) -> dict:
+    """容量与过期淘汰：防止 KV 随搜索面无限增长。
+    1) 删掉衰减到 FRECENCY_DROP_SCORE 以下的条目；
+    2) 每源只留分数最高的 FRECENCY_MAX_PER_SOURCE 条；
+    3) 源数超限时删掉最冷（总分最低）的源；
+    4) 全局条目硬上限兜底。"""
+    now = now if now is not None else _now_hours()
+    out: dict = {}
+    for key, bucket in kv.items():
+        kept = {}
+        for rel, v in (bucket or {}).items():
+            s_old = v.get("s", 0.0)
+            t_old = v.get("t", now)
+            score = s_old * (0.5 ** ((now - t_old) / FRECENCY_HALF_LIFE_HOURS))
+            if score <= FRECENCY_DROP_SCORE:
+                continue  # 太久没访问，直接丢
+            kept[rel] = {"s": round(score, 3), "t": round(t_old, 3)}
+        if not kept:
+            continue
+        if len(kept) > FRECENCY_MAX_PER_SOURCE:
+            top = sorted(kept.items(), key=lambda kv2: -kv2[1]["s"])[:FRECENCY_MAX_PER_SOURCE]
+            kept = dict(top)
+        out[key] = kept
+    # 源数超限：按总分排序，丢最冷的
+    if len(out) > FRECENCY_MAX_SOURCES:
+        ranked = sorted(out.items(), key=lambda kv2: -sum(v["s"] for v in kv2[1].values()))
+        out = dict(ranked[:FRECENCY_MAX_SOURCES])
+    # 全局硬上限：再按分数截断
+    total = sum(len(v) for v in out.values())
+    if total > FRECENCY_MAX_TOTAL:
+        flat = [(k, rel, v["s"]) for k, b in out.items() for rel, v in b.items()]
+        flat.sort(key=lambda x: -x[2])
+        flat = flat[:FRECENCY_MAX_TOTAL]
+        out = {}
+        for k, rel, sc in flat:
+            out.setdefault(k, {})[rel] = {"s": sc, "t": round(now, 3)}
+    return out
+
+
 def _frecency_bump(plugin, src: str, rels: list) -> None:
-    """把本次返回的文件记一次访问（衰减后的旧分 + 1）。"""
+    """记一次访问（衰减后的旧分 + 1），随后跑 GC 控制体积。"""
     if not (plugin and plugin.kv_ready) or not rels:
         return
     now = _now_hours()
@@ -131,6 +175,7 @@ def _frecency_bump(plugin, src: str, rels: list) -> None:
     plugin.kv[_frecency_key(src)] = {
         k: {"s": round(v[0], 3), "t": round(v[1], 3)} for k, v in data.items()
     }
+    plugin.kv = _gc_frecency(plugin.kv, now)
 
 
 def _frecency_annotate(score: float) -> str:
@@ -466,14 +511,8 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         plugin = self.plugin_ref
         if not (plugin and plugin.kv_ready) or not rels:
             return
-        now = _now_hours()
-        data = _frecency_load(plugin, src)
-        for rel in rels:
-            s_old, t_old = data.get(rel, [0.0, now])
-            data[rel] = [s_old * (0.5 ** ((now - t_old) / FRECENCY_HALF_LIFE_HOURS)) + 1.0, now]
-        payload = {k: {"s": round(v[0], 3), "t": round(v[1], 3)} for k, v in data.items()}
-        plugin.kv[_frecency_key(src)] = payload
-        asyncio.create_task(plugin._save_kv(src, payload))
+        _frecency_bump(plugin, src, rels)  # 内部会跑 GC 控制体积
+        asyncio.create_task(plugin._save_kv(src, plugin.kv.get(_frecency_key(src), {})))
 
     @staticmethod
     def _render_content(root, order, matches, ctx_lines, limit, offset) -> list[str]:
@@ -982,9 +1021,18 @@ class SelfFileSearchPlugin(star.Star):
 
     async def _load_kv(self) -> None:
         try:
-            self.kv = await self.get_kv_data("frecency", {}) or {}
+            raw = await self.get_kv_data("frecency", {}) or {}
+            self.kv = _gc_frecency(raw)
             self.kv_ready = True
-            logger.debug(f"frecency loaded: {len(self.kv)} source buckets")
+            # 如果 GC 裁掉了内容，回写一次，别让本体存着旧的大对象
+            if len(self.kv) != len(raw) or sum(len(v) for v in self.kv.values()) != sum(
+                len(v) for v in raw.values()
+            ):
+                await self.put_kv_data("frecency", self.kv)
+            logger.debug(
+                f"frecency loaded: {len(self.kv)} buckets, "
+                f"{sum(len(v) for v in self.kv.values())} entries"
+            )
         except Exception as exc:
             logger.warning(f"frecency load failed, ranking disabled: {exc}")
             self.kv_ready = False
@@ -993,7 +1041,11 @@ class SelfFileSearchPlugin(star.Star):
         if not self.kv_ready:
             return
         try:
-            self.kv[_frecency_key(src)] = data
+            # data 为空说明该桶被 GC 清掉了，同步移除
+            if data:
+                self.kv[_frecency_key(src)] = data
+            else:
+                self.kv.pop(_frecency_key(src), None)
             await self.put_kv_data("frecency", self.kv)
         except Exception as exc:
             logger.warning(f"frecency save failed: {exc}")
@@ -1001,4 +1053,11 @@ class SelfFileSearchPlugin(star.Star):
     async def terminate(self) -> None:
         if self._kv_task and not self._kv_task.done():
             self._kv_task.cancel()
+        # 插件卸载/停用时清掉自己的 KV，不给 AstrBot 本体留垃圾
+        try:
+            await self.delete_kv_data("frecency")
+            self.kv, self.kv_ready = {}, False
+            logger.info("astrbot_plugin_self_file_search: frecency KV cleared")
+        except Exception as exc:
+            logger.warning(f"frecency KV cleanup failed: {exc}")
         await self.lsp.shutdown()
