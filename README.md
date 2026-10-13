@@ -37,7 +37,7 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 
 | 工具 | 功能 |
 |------|------|
-| `self_search` | 目录内 grep：`mode=content`（命中行，默认）/ `files`（命中文件）/ `count`（每文件计数）；支持正则、大小写、`context_lines` 前后文、`offset` 翻页；头部给出「还剩多少条、估计还需几页」 |
+| `self_search` | 目录内 grep：`mode=content`（命中行，默认）/ `files`（命中文件）/ `count`（每文件计数）；支持正则、大小写、`context_lines` 前后文、`offset` 翻页、`exclude_glob` 排除；`files` 模式按访问频率排序并标注常用文件；头部给出「还剩多少条、估计还需几页」 |
 | `self_read` | 读文件（带行号）；`start_line`/`end_line` 指定行区间（`end_line` 负数从末尾倒数，`-1` = 最后一行）；头部给出「还剩多少行/约多少字符/估计还需几次」，末尾给出精确续读参数；`files` 数组一次最多批量读 8 个，共享输出预算，逐文件报错 |
 | `self_glob` | 按文件名通配符列文件（如 `*.cs`、`Card*.cs`） |
 
@@ -82,6 +82,7 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 | `lsp_enabled` | bool | `true` | 启用 LSP 语义工具 |
 | `lsp_idle_minutes` | int | `10` | LSP 服务器空闲多久自动关闭 |
 | `lsp_servers` | list | `[]` | 覆盖探测表，每项 `扩展名\|命令行`（如 `cs\|csharp-ls`） |
+| `frecency_enabled` | bool | `true` | `self_search` 的 files 模式按访问频率排序（数据存 AstrBot 插件 KV，不写本地文件） |
 
 ## 项目结构
 
@@ -93,6 +94,11 @@ astrbot_plugin_self_file_search/
 ├── _conf_schema.json                # 插件配置 Schema
 └── README.md
 ```
+
+## 借鉴来源
+
+- [fastctx](https://github.com/yc-duan/fastctx)：grep 多输出模式、批量 read 与 Partial 续读、schema 可移植子集铁律。
+- [fff](https://github.com/dmtrKovalenko/fff) / `pi-fff`：frecency 排序、`exclude` 排除语法、按查询长度缩放的弱匹配阈值思路。
 
 ## 相关链接
 

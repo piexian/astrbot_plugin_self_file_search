@@ -64,5 +64,11 @@
     "type": "list",
     "hint": "例：cs|csharp-ls。留空则从 PATH 自动探测常见语言服务器；此配置优先于内置探测表，任何环境都能用。",
     "default": []
+  },
+  "frecency_enabled": {
+    "description": "启用访问频率排序（frecency）",
+    "type": "bool",
+    "default": true,
+    "hint": "self_search 的 files 模式按「访问频率 + 时间衰减」排序，常查的文件排前面并标注 [常看]/[看过]。数据存在 AstrBot 自带的插件 KV 存储里，不写本地文件。"
   }
 }

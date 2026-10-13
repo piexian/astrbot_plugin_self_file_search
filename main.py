@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -22,6 +23,10 @@ from astrbot.core.astr_agent_context import AstrAgentContext
 from .lsp import LSPManager, SYMBOL_KINDS, guess_ext, parse_overrides, to_utf16_char, uri_to_path
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".idea", ".vs"}
+# frecency：访问一次 +1，按小时半衰（约 24h 衰减到 ~5%）
+FRECENCY_HALF_LIFE_HOURS = 24.0
+FRECENCY_HOT = 4.0   # >= 该分数标 [常看]
+FRECENCY_WARM = 1.5  # >= 该分数标 [看过]
 MAX_SCAN_FILES = 20000
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_LINE_CHARS = 300
@@ -101,6 +106,43 @@ def _stamp(root: str) -> str:
         return f"[{text}] " if text else ""
     except (OSError, ValueError):
         return ""
+
+
+def _frecency_key(src: str) -> str:
+    return f"frecency:{src}"
+
+
+def _frecency_load(plugin, src: str) -> dict:
+    """{rel: [score, last_epoch_hours]}；KV 里是 {rel: {"s": float, "t": float}}。"""
+    raw = plugin.kv.get(_frecency_key(src), {}) if plugin and plugin.kv_ready else {}
+    return {k: [v.get("s", 0.0), v.get("t", 0.0)] for k, v in (raw or {}).items()}
+
+
+def _frecency_bump(plugin, src: str, rels: list) -> None:
+    """把本次返回的文件记一次访问（衰减后的旧分 + 1）。"""
+    if not (plugin and plugin.kv_ready) or not rels:
+        return
+    now = _now_hours()
+    data = _frecency_load(plugin, src)
+    for rel in rels:
+        s_old, t_old = data.get(rel, [0.0, now])
+        decayed = s_old * (0.5 ** ((now - t_old) / FRECENCY_HALF_LIFE_HOURS))
+        data[rel] = [decayed + 1.0, now]
+    plugin.kv[_frecency_key(src)] = {
+        k: {"s": round(v[0], 3), "t": round(v[1], 3)} for k, v in data.items()
+    }
+
+
+def _frecency_annotate(score: float) -> str:
+    if score >= FRECENCY_HOT:
+        return "  [常看的文件]"
+    if score >= FRECENCY_WARM:
+        return "  [看过的文件]"
+    return ""
+
+
+def _now_hours() -> float:
+    return time.time() / 3600.0
 
 
 def _err(msg: str) -> str:
@@ -200,6 +242,31 @@ def _pick_source(kwargs: dict, cfg: dict) -> tuple[str, str] | str:
     return src, root
 
 
+def _parse_excludes(raw) -> list[str]:
+    """exclude_glob: 逗号/空格分隔，允许前缀 !（与 fff 的排除语法一致）。"""
+    if not raw:
+        return []
+    text = str(raw)
+    out = []
+    for part in re.split(r"[,\s]+", text):
+        p = part.strip().lstrip("!")
+        if p:
+            out.append(p)
+    return out
+
+
+def _is_excluded(rel: str, exclude: list[str]) -> bool:
+    """相对路径或其任一路径段命中排除模式则跳过。"""
+    base = rel.rsplit("/", 1)[-1]
+    for pat in exclude:
+        if fnmatch(rel, pat) or fnmatch(base, pat):
+            return True
+        # 目录前缀形式（如 generated/）
+        if pat.endswith("/") and rel.startswith(pat):
+            return True
+    return False
+
+
 def _compile(pattern: str, case_sensitive: bool, is_regex: bool):
     flags = 0 if case_sensitive else re.IGNORECASE
     return re.compile(pattern if is_regex else re.escape(pattern), flags)
@@ -236,6 +303,10 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             "file_glob": {
                 "type": "string",
                 "description": "Optional filename glob filter, e.g. *.cs; default all files",
+            },
+            "exclude_glob": {
+                "type": "string",
+                "description": "Optional globs to skip, comma-separated, e.g. '*.Designer.cs, generated/*'; leading ! tolerated",
             },
             "is_regex": {
                 "type": "boolean",
@@ -289,6 +360,7 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         offset = max(0, int(kwargs.get("offset", 0) or 0))
         ctx_lines = max(0, min(int(kwargs.get("context_lines", 0) or 0), 10)) if mode == "content" else 0
         glob = str(kwargs.get("file_glob", "")).strip() or "*"
+        exclude = _parse_excludes(kwargs.get("exclude_glob"))
 
         # 收集每个文件的命中行号（含行文本），扫描由文件数/时限双封顶
         matches: dict[str, dict[int, str]] = {}
@@ -304,6 +376,8 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                     incomplete = True
                     break
                 if not fnmatch(fn, glob):
+                    continue
+                if exclude and _is_excluded(os.path.relpath(os.path.join(dirpath, fn), root).replace("\\", "/"), exclude):
                     continue
                 path = os.path.join(dirpath, fn)
                 try:
@@ -333,8 +407,18 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         )
         head = f"{_stamp(root)}[{src}] {mode} 模式"
         if mode == "files":
-            entries = [f"{rel}（{len(matches[rel])} 处）" for rel in order][offset:offset + limit]
+            # files 模式按 frecency 排序：常查的文件（Card.cs 这类）排前面。
+            # content/count 不动——content 逐行命中，重排会打乱行号语义。
+            order = self._rank_by_frecency(src, order)
+            entries = [
+                f"{rel}（{len(matches[rel])} 处）{self._frecency_tag(src, rel)}"
+                for rel in order
+            ][offset:offset + limit]
             head += f"，命中文件 {len(order)} 个"
+            if self.plugin_ref and self.plugin_ref.kv_ready:
+                head += "（按访问频率排序）"
+            # 记一次访问（异步落盘，不阻塞返回）
+            self._bump(src, order[offset:offset + limit])
         elif mode == "count":
             entries = [f"{rel}: {len(matches[rel])}" for rel in order][offset:offset + limit]
             head += f"，命中文件 {len(order)} 个，共 {total} 处"
@@ -360,6 +444,36 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             next_hint = ("本次已输出 " + str(shown) + " 条：翻页用 offset=" + str(offset + shown) + " 继续，或用 file_glob 收窄、max_matches 调小后重搜。")
             body = body[: SEARCH_OUTPUT_CAP - len(head)] + "\n…（输出超限截断）" + next_hint
         return head + "\n" + body
+
+    def _score(self, src: str, rel: str) -> float:
+        plugin = self.plugin_ref
+        if not (plugin and plugin.kv_ready):
+            return 0.0
+        data = _frecency_load(plugin, src)
+        s_old, t_old = data.get(rel, [0.0, _now_hours()])
+        return s_old * (0.5 ** ((_now_hours() - t_old) / FRECENCY_HALF_LIFE_HOURS))
+
+    def _rank_by_frecency(self, src: str, order: list[str]) -> list[str]:
+        """稳定排序：frecency 降序，同分保持原顺序。"""
+        if not (self.plugin_ref and self.plugin_ref.kv_ready):
+            return list(order)
+        return sorted(order, key=lambda r: -self._score(src, r))
+
+    def _frecency_tag(self, src: str, rel: str) -> str:
+        return _frecency_annotate(self._score(src, rel))
+
+    def _bump(self, src: str, rels: list[str]) -> None:
+        plugin = self.plugin_ref
+        if not (plugin and plugin.kv_ready) or not rels:
+            return
+        now = _now_hours()
+        data = _frecency_load(plugin, src)
+        for rel in rels:
+            s_old, t_old = data.get(rel, [0.0, now])
+            data[rel] = [s_old * (0.5 ** ((now - t_old) / FRECENCY_HALF_LIFE_HOURS)) + 1.0, now]
+        payload = {k: {"s": round(v[0], 3), "t": round(v[1], 3)} for k, v in data.items()}
+        plugin.kv[_frecency_key(src)] = payload
+        asyncio.create_task(plugin._save_kv(src, payload))
 
     @staticmethod
     def _render_content(root, order, matches, ctx_lines, limit, offset) -> list[str]:
@@ -842,6 +956,13 @@ class SelfFileSearchPlugin(star.Star):
         self.config = config
         self.lsp = LSPManager(int(config.get("lsp_idle_minutes", 10) or 10))
         self._lsp_ext_cache: dict[str, str | None] = {}
+        # frecency 走 AstrBot 自带的插件 KV 存储（Star 已混入 PluginKVStoreMixin），
+        # 不自己落盘：跨重载保留、无并发写竞争。
+        self.kv: dict = {}
+        self.kv_ready = False
+        self._kv_task = None
+        if config.get("frecency_enabled", True):
+            self._kv_task = asyncio.create_task(self._load_kv())
         sources = _sources(config)
         if not sources:
             # 全部数据源停用（含 AstrBot 白名单开关）时不注册工具，
@@ -859,5 +980,25 @@ class SelfFileSearchPlugin(star.Star):
         )
         logger.info("astrbot_plugin_self_file_search: self_search/self_read/self_glob/self_symbols/self_refs/self_def registered")
 
+    async def _load_kv(self) -> None:
+        try:
+            self.kv = await self.get_kv_data("frecency", {}) or {}
+            self.kv_ready = True
+            logger.debug(f"frecency loaded: {len(self.kv)} source buckets")
+        except Exception as exc:
+            logger.warning(f"frecency load failed, ranking disabled: {exc}")
+            self.kv_ready = False
+
+    async def _save_kv(self, src: str, data: dict) -> None:
+        if not self.kv_ready:
+            return
+        try:
+            self.kv[_frecency_key(src)] = data
+            await self.put_kv_data("frecency", self.kv)
+        except Exception as exc:
+            logger.warning(f"frecency save failed: {exc}")
+
     async def terminate(self) -> None:
+        if self._kv_task and not self._kv_task.done():
+            self._kv_task.cancel()
         await self.lsp.shutdown()
