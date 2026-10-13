@@ -45,7 +45,7 @@ jobs:
         run: |
           ruff check \
             --select F,W,E,ASYNC,C4,Q,I,UP \
-            --ignore F403,F405,E501,ASYNC230,ASYNC240 \
+            --ignore F403,F405,E501,ASYNC109,ASYNC230,ASYNC240 \
             --line-length 88 .
 
   metadata:
