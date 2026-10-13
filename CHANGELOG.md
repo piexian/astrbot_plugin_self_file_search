@@ -2,7 +2,7 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [1.0.2] - 2026-10-11
+## [1.0.2] - 2026-10-13
 
 ### Added
 - `self_search` 新增 `exclude_glob`：逗号分隔的排除模式，支持 `!` 前缀与 `目录/` 形式，比反复收窄 `file_glob` 高效。
@@ -37,5 +37,3 @@
 - 目录约定：数据源根目录的 `version.json`（`versionText` / `version`）作为版本戳出现在工具输出中，与外部自动更新脚本解耦。
 - 安全设计：白名单 realpath 包含校验、只读、资源封顶、LSP 返回位置二次校验、注册门控、schema 可移植子集。
 
-### Removed
-- 不再保留初期的 `code_*` 工具命名与字符串格式数据源配置（插件未发布，不做兼容）。
