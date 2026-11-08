@@ -18,8 +18,8 @@
 - 6 个 LLM Tool：文本级 `self_search` / `self_read` / `self_glob` + 语义级 `self_symbols` / `self_refs` / `self_def`
 - 数据源条目化配置（启用 / 名称 / 路径 / 描述），支持多源与版本戳
 - 一键并入 AstrBot 自身白名单目录（工作区 / 全局技能 / 插件 skills / 临时目录）
-- LSP 服务器通用加载：调用时在当前环境 PATH 逐个探测，配置可覆盖，任何环境有啥用啥
-- 服务器进程惰性启动、空闲自动关闭
+- LSP 服务器通用加载：PATH 探测或命令覆盖，按文件发现最近项目根目录
+- 服务器进程惰性启动、失败熔断、空闲自动关闭，支持 Windows 进程树清理
 - 输出限长 + 分页，防止撑爆上下文
 
 ## 安装
@@ -43,11 +43,11 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 
 ### LSP 语义级（需要环境里有对应语言服务器）
 
-C# 使用 `csharp-ls` 时，数据源内必须至少有一个 `.sln`、`.csproj` 或 `.fsproj` 文件；子目录中的项目文件也可被识别。
+C# 使用 `csharp-ls` 时，数据源内必须至少有一个 `.sln`、`.csproj` 或 `.fsproj` 文件。插件不自动安装服务器；各服务器可能按自身机制生成索引或缓存。
 
 | 工具 | 功能 |
 |------|------|
-| `self_symbols` | 工作区符号搜索（类/方法/字段），首次调用可能在建立索引 |
+| `self_symbols` | 工作区符号搜索（类/方法/字段）；可选 `path` 用于选择最近项目并先打开文件建立上下文 |
 | `self_refs` | 符号的全部引用（跨文件语义解析），`path/line` 定位，`symbol` 缺省取该行第一个标识符 |
 | `self_def` | 跳到符号定义处（可跨文件） |
 
@@ -84,6 +84,7 @@ C# 使用 `csharp-ls` 时，数据源内必须至少有一个 `.sln`、`.csproj`
 | `lsp_enabled` | bool | `true` | 启用 LSP 语义工具 |
 | `lsp_idle_minutes` | int | `10` | LSP 服务器空闲多久自动关闭 |
 | `lsp_servers` | list | `[]` | 覆盖探测表，每项 `扩展名\|命令行`（如 `cs\|csharp-ls`） |
+| `lsp_initialization` | list | `[]` | 初始化参数，每项 `服务器或扩展名\|JSON 对象`，同时用于响应 `workspace/configuration` |
 | `frecency_enabled` | bool | `true` | `self_search` 的 files 模式按访问频率排序（数据存 AstrBot 插件 KV，不写本地文件） |
 
 ## 项目结构

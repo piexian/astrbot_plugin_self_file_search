@@ -1,11 +1,13 @@
 import asyncio
+import json
 import logging
+import os
 import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO.parent))
@@ -51,6 +53,18 @@ class FakeProcess:
         self.killed = True
 
 
+def decode_frames(data):
+    messages = []
+    while data:
+        header, separator, rest = data.partition(b"\r\n\r\n")
+        if not separator:
+            break
+        length = int(header.split(b"Content-Length: ", 1)[1].split(b"\r\n", 1)[0])
+        messages.append(json.loads(rest[:length].decode("utf-8")))
+        data = rest[length:]
+    return messages
+
+
 class ProjectDetectionTests(unittest.TestCase):
     def test_csharp_project_detection_supports_nested_projects(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -92,6 +106,21 @@ class LspClientTests(unittest.IsolatedAsyncioTestCase):
         result = await client._request("test", {})
 
         self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(decode_frames(bytes(proc.stdin.data))), 1)
+
+    async def test_error_response_raises_server_message(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            lsp.LSPClient._frame(
+                {"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": "broken"}}
+            )
+        )
+        reader.feed_eof()
+        client = self.make_client()
+        client.proc = FakeProcess(stdout=reader)
+
+        with self.assertRaisesRegex(RuntimeError, "test: broken"):
+            await client._request("test", {})
 
     async def test_eof_error_includes_exit_code_and_stderr(self):
         class EofStream:
@@ -169,6 +198,178 @@ class LspClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(proc.stdin.data, b"")
         self.assertTrue(proc._transport.closed)
         self.assertIsNone(client.proc)
+
+
+class ServerAdapterTests(unittest.IsolatedAsyncioTestCase):
+    def test_initialization_config_is_parsed_and_validated(self):
+        items = [r'rust-analyzer|{"linkedProjects":["rust-project.json"]}']
+        self.assertEqual(
+            lsp.parse_initialization(items),
+            {"rust-analyzer": {"linkedProjects": ["rust-project.json"]}},
+        )
+        with self.assertRaisesRegex(ValueError, "JSON 对象"):
+            lsp.parse_initialization(["gopls|[]"])
+        with self.assertRaisesRegex(ValueError, "JSON 无效"):
+            lsp.parse_initialization(["gopls|{"])
+
+    def test_file_selects_nested_csharp_project_and_loose_files_fall_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            project = source / "versions" / "current"
+            source_file = project / "src" / "Quest.cs"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text("public class Quest {}", encoding="utf-8")
+            (project / "Elin.csproj").write_text("<Project />", encoding="utf-8")
+
+            selected = lsp.resolve_root(
+                str(source), str(source_file), "csharp-ls", "cs"
+            )
+            fallback = lsp.resolve_root(str(source), str(source_file), "unknown", "txt")
+
+            self.assertEqual(selected, str(project))
+            self.assertEqual(fallback, str(source))
+
+    def test_gopls_prefers_go_work_over_nested_module(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            module = source / "module"
+            source_file = module / "src" / "main.go"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text("package main", encoding="utf-8")
+            (source / "go.work").write_text("go 1.24", encoding="utf-8")
+            (module / "go.mod").write_text("module example", encoding="utf-8")
+
+            selected = lsp.resolve_root(str(source), str(source_file), "gopls", "go")
+
+            self.assertEqual(selected, str(source))
+
+    def test_initialize_declares_only_supported_workspace_behaviour(self):
+        client = lsp.LSPClient(
+            "/tmp", "cs", ["csharp-ls"], initialization={"csharp": {"x": 1}}
+        )
+        params = client._initialize_params()
+        self.assertTrue(params["capabilities"]["workspace"]["workspaceFolders"])
+        self.assertTrue(params["capabilities"]["workspace"]["configuration"])
+        self.assertEqual(params["initializationOptions"], {"csharp": {"x": 1}})
+
+        omnisharp = lsp.LSPClient("/tmp", "cs", ["omnisharp"])
+        params = omnisharp._initialize_params()
+        self.assertNotIn("workspaceFolders", params)
+        self.assertNotIn("workspaceFolders", params["capabilities"]["workspace"])
+
+    async def test_server_request_is_answered_before_matching_response(self):
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            lsp.LSPClient._frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 99,
+                    "method": "workspace/configuration",
+                    "params": {
+                        "items": [{"section": "csharp"}, {"section": "missing"}]
+                    },
+                }
+            )
+        )
+        reader.feed_data(
+            lsp.LSPClient._frame({"jsonrpc": "2.0", "id": 1, "result": ["ok"]})
+        )
+        reader.feed_eof()
+        proc = FakeProcess(stdout=reader)
+        client = lsp.LSPClient(
+            "/tmp",
+            "cs",
+            ["csharp-ls"],
+            initialization={"csharp": {"solution": "Elin.csproj"}},
+        )
+        client.proc = proc
+
+        result = await client._request("workspace/symbol", {"query": "Quest"})
+
+        self.assertEqual(result, ["ok"])
+        messages = decode_frames(bytes(proc.stdin.data))
+        response = next(message for message in messages if message.get("id") == 99)
+        self.assertEqual(response["id"], 99)
+        self.assertEqual(response["result"], [{"solution": "Elin.csproj"}, None])
+
+    async def test_unsupported_server_request_gets_method_not_found(self):
+        proc = FakeProcess()
+        client = lsp.LSPClient("/tmp", "cs", ["csharp-ls"])
+        client.proc = proc
+
+        await client._handle_server_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "client/registerCapability",
+                "params": {},
+            }
+        )
+
+        response = decode_frames(bytes(proc.stdin.data))[0]
+        self.assertEqual(response["error"]["code"], -32601)
+
+    async def test_symbols_open_reference_file_before_workspace_query(self):
+        client = lsp.LSPClient("/tmp", "cs", ["csharp-ls"])
+        client._ensure_open = AsyncMock()
+        client._request = AsyncMock(return_value=[])
+
+        await client.symbols("Quest", path="/tmp/Quest.cs")
+
+        client._ensure_open.assert_awaited_once_with("/tmp/Quest.cs")
+        client._request.assert_awaited_once_with(
+            "workspace/symbol", {"query": "Quest"}, timeout=90
+        )
+
+    async def test_start_failure_is_not_retried_until_shutdown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = lsp.LSPManager()
+            with (
+                patch.object(lsp, "probe", return_value=(["csharp-ls"], [])),
+                patch.object(
+                    lsp.LSPClient,
+                    "start",
+                    new=AsyncMock(side_effect=RuntimeError("boom")),
+                ) as start,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    await manager.get(tmp, "cs", {})
+                with self.assertRaisesRegex(RuntimeError, "已标记不可用"):
+                    await manager.get(tmp, "cs", {})
+                start.assert_awaited_once()
+            await manager.shutdown()
+
+    async def test_windows_force_stop_uses_process_tree(self):
+        class Killer:
+            returncode = 0
+            communicate = AsyncMock(return_value=(b"", b""))
+
+        proc = types.SimpleNamespace(pid=123, kill=Mock())
+        with (
+            patch.object(lsp, "_is_windows", return_value=True),
+            patch(
+                "asyncio.create_subprocess_exec", new=AsyncMock(return_value=Killer())
+            ) as spawn,
+        ):
+            await lsp._kill_process_tree(proc)
+
+        self.assertEqual(
+            spawn.await_args.args[:5], ("taskkill", "/pid", "123", "/T", "/F")
+        )
+        proc.kill.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows batch launch regression")
+    async def test_windows_cmd_script_with_spaces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp) / "with space"
+            directory.mkdir()
+            script = directory / "fake server.cmd"
+            script.write_text("@echo off\r\nexit /b 0\r\n", encoding="ascii")
+
+            proc = await lsp._spawn_lsp_process([str(script)], str(directory))
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+
+            self.assertEqual(proc.returncode, 0)
 
 
 if __name__ == "__main__":

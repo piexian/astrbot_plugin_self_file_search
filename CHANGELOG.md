@@ -3,6 +3,13 @@
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
 
+
+## [1.1.0] - 2026-11-09
+
+- 按服务器和文件发现项目根目录，`self_symbols` 支持可选 `path` 建立文件上下文。
+- 新增 `lsp_initialization`，补齐 workspace 能力声明与服务端配置/进度/工作区请求响应。
+- Windows 隐藏控制台并在强制关闭时清理进程树；启动或进程故障后熔断，避免反复崩溃。
+- 单元测试覆盖 Linux、Windows、macOS，包含 Windows 带空格 `.cmd` 启动回归。
 ## [1.0.4] - 2026-11-09
 
 - 修复 `file_glob` 相对路径匹配，`self_search` / `self_glob` 支持逗号分隔的多个模式。

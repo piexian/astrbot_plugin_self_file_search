@@ -65,6 +65,12 @@
     "hint": "例：cs|csharp-ls。留空则从 PATH 自动探测常见语言服务器；此配置优先于内置探测表，任何环境都能用。",
     "default": []
   },
+  "lsp_initialization": {
+    "description": "LSP 初始化参数，每项：服务器或扩展名|JSON 对象",
+    "type": "list",
+    "hint": "例：rust-analyzer|{\"linkedProjects\":[\"rust-project.json\"]}；也用于响应 workspace/configuration。",
+    "default": []
+  },
   "frecency_enabled": {
     "description": "启用访问频率排序（frecency）",
     "type": "bool",

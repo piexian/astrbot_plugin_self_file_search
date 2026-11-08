@@ -21,6 +21,7 @@ from .lsp import (
     SYMBOL_KINDS,
     LSPManager,
     guess_ext,
+    parse_initialization,
     parse_overrides,
     to_utf16_char,
     uri_to_path,
@@ -228,8 +229,10 @@ def _locate(line_text: str, symbol: str | None) -> tuple[str, int] | None:
     return symbol, col
 
 
-async def _lsp_client(plugin, kwargs, root: str, ext_hint: str | None = None):
-    """拿到 LSP 客户端；失败返回错误字符串。ext 未指定时按数据源里最多的已知扩展名。"""
+async def _lsp_client(
+    plugin, kwargs, root: str, ext_hint: str | None = None, path: str | None = None
+):
+    """拿到 LSP 客户端；失败返回错误字符串。"""
     if not plugin.config.get("lsp_enabled", True):
         return _err("lsp_enabled 已关闭。")
     ext = str(kwargs.get("ext", "")).strip().lstrip(".").lower() or ext_hint
@@ -237,9 +240,14 @@ async def _lsp_client(plugin, kwargs, root: str, ext_hint: str | None = None):
         return _err(
             "无法判断语言（数据源里没有已知扩展名的文件），可用 ext 参数显式指定。"
         )
-    overrides = parse_overrides(plugin.config.get("lsp_servers"))
     try:
-        return await plugin.lsp.get(root, ext, overrides)
+        overrides = parse_overrides(plugin.config.get("lsp_servers"))
+        initialization = parse_initialization(plugin.config.get("lsp_initialization"))
+        return await plugin.lsp.get(
+            root, ext, overrides, path=path, initialization=initialization
+        )
+    except ValueError as exc:
+        return _err(f"LSP 初始化配置错误：{exc}")
     except RuntimeError as exc:
         logger.debug(f"LSP unavailable: {exc}")
         return _err(str(exc))
@@ -973,8 +981,9 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
         "Search workspace symbols (classes/methods/fields/enums) via the language "
         "server — semantically more precise than plain-text search. Requires an LSP "
         "server for the language on PATH; on first call the server may still be "
-        "indexing, so retry if the result is empty. csharp-ls also requires a "
-        ".sln/.csproj/.fsproj file under the source."
+        "indexing, so retry if the result is empty. Optional path selects the nearest "
+        "project root and opens that file before the workspace query. csharp-ls requires "
+        "a .sln/.csproj/.fsproj file under the source."
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -984,6 +993,10 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
                 "query": {
                     "type": "string",
                     "description": "Symbol name or a part of it, e.g. ThrowMethod",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional file inside the source used to select its project and establish LSP context",
                 },
                 "ext": {
                     "type": "string",
@@ -1007,10 +1020,21 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
         if isinstance(picked, str):
             return picked
         _src, root = picked
-        if not self.plugin_ref._lsp_ext_cache.get(root):
-            self.plugin_ref._lsp_ext_cache[root] = guess_ext(root)
+        rel_path = str(kwargs.get("path", "")).strip()
+        abs_path = None
+        if rel_path:
+            abs_path = _contain(root, rel_path)
+            if abs_path is None:
+                return _err("路径越界或非法（拒绝绝对路径与 ..）。")
+            if not os.path.isfile(abs_path):
+                return _err(f"文件不存在：{rel_path}")
+        ext_hint = os.path.splitext(abs_path)[1].lstrip(".").lower() if abs_path else ""
+        if not ext_hint:
+            if not self.plugin_ref._lsp_ext_cache.get(root):
+                self.plugin_ref._lsp_ext_cache[root] = guess_ext(root)
+            ext_hint = self.plugin_ref._lsp_ext_cache.get(root)
         client = await _lsp_client(
-            self.plugin_ref, kwargs, root, self.plugin_ref._lsp_ext_cache.get(root)
+            self.plugin_ref, kwargs, root, ext_hint, path=abs_path
         )
         if isinstance(client, str):
             return client
@@ -1019,7 +1043,7 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
             return _err("query 为空。")
         limit = max(1, min(int(kwargs.get("max", 30) or 30), 100))
         try:
-            result = await client.symbols(query)
+            result = await client.symbols(query, path=abs_path)
         except Exception as exc:  # noqa: BLE001 - LSP 异常需转成用户可读错误
             return _err(f"符号搜索失败：{exc}")
         items = result if isinstance(result, list) else []
@@ -1035,7 +1059,7 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
             lines.append(f"{rel}:{line1}: [{kind}] {item.get('name', '')}")
         head = f"符号 {query!r} 命中 {len(lines)} 条"
         if not lines:
-            head += "（服务器可能仍在建立索引，稍后重试通常会有结果；也可先用 code_search 文本兜底）"
+            head += "（服务器可能仍在建立索引，稍后重试通常会有结果；也可先用 self_search 文本兜底）"
         return head + "\n" + "\n".join(lines)
 
 
@@ -1103,10 +1127,13 @@ class SelfRefsTool(FunctionTool[AstrAgentContext]):
         if located is None:
             return _err("该行找不到可定位的标识符，请用 symbol 参数指明。")
         symbol, col = located
-        if not self.plugin_ref._lsp_ext_cache.get(root):
-            self.plugin_ref._lsp_ext_cache[root] = guess_ext(root)
+        ext_hint = os.path.splitext(abs_path)[1].lstrip(".").lower()
+        if not ext_hint:
+            if not self.plugin_ref._lsp_ext_cache.get(root):
+                self.plugin_ref._lsp_ext_cache[root] = guess_ext(root)
+            ext_hint = self.plugin_ref._lsp_ext_cache.get(root)
         client = await _lsp_client(
-            self.plugin_ref, kwargs, root, self.plugin_ref._lsp_ext_cache.get(root)
+            self.plugin_ref, kwargs, root, ext_hint, path=abs_path
         )
         if isinstance(client, str):
             return client
