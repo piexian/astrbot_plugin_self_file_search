@@ -147,6 +147,23 @@ def no_server_msg(ext: str, tried: list[str]) -> str:
     )
 
 
+LSP_STDERR_CAP = 16000
+LSP_PROJECT_SUFFIXES = (".sln", ".csproj", ".fsproj")
+
+
+def _is_csharp_ls(argv: list[str]) -> bool:
+    name = argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower() if argv else ""
+    return name.removesuffix(".exe") == "csharp-ls"
+
+
+def _has_csharp_project(root: str) -> bool:
+    for _dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        if any(fn.lower().endswith(LSP_PROJECT_SUFFIXES) for fn in filenames):
+            return True
+    return False
+
+
 class LSPClient:
     """单个语言服务器进程。请求串行化（锁），响应按 id 匹配，通知丢弃。"""
 
@@ -156,54 +173,100 @@ class LSPClient:
         self._lock = asyncio.Lock()
         self._next_id = 0
         self._opened: set[str] = set()
+        self._stderr = bytearray()
+        self._stderr_task: asyncio.Task | None = None
         self.last_used = time.monotonic()
 
     async def start(self) -> None:
+        if _is_csharp_ls(self.argv) and not _has_csharp_project(self.root):
+            raise RuntimeError(
+                f"csharp-ls 需要数据源内至少一个 .sln/.csproj/.fsproj 文件：{self.root}"
+            )
         started = time.monotonic()
         logger.debug(f"LSP spawning: {self.argv} (root={self.root})")
         self.proc = await asyncio.create_subprocess_exec(
             *self.argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
             cwd=self.root,
         )
-        result = await self._request(
-            "initialize",
-            {
-                "processId": os.getpid(),
-                "rootUri": _path_to_uri(self.root),
-                "workspaceFolders": [
-                    {
-                        "uri": _path_to_uri(self.root),
-                        "name": os.path.basename(self.root),
-                    }
-                ],
-                "capabilities": {},
-            },
-            timeout=60,
-        )
-        if result is None:
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
+        try:
+            result = await self._request(
+                "initialize",
+                {
+                    "processId": os.getpid(),
+                    "rootUri": _path_to_uri(self.root),
+                    "workspaceFolders": [
+                        {
+                            "uri": _path_to_uri(self.root),
+                            "name": os.path.basename(self.root),
+                        }
+                    ],
+                    "capabilities": {},
+                },
+                timeout=60,
+            )
+            if result is None:
+                raise RuntimeError("initialize 失败")
+            await self._notify("initialized", {})
+        except Exception:
             await self.stop()
-            raise RuntimeError("initialize 失败")
-        await self._notify("initialized", {})
+            raise
         logger.debug(
             f"LSP initialized: {self.ext} @ {self.root} in {time.monotonic() - started:.1f}s"
         )
 
-    async def stop(self) -> None:
-        proc, self.proc = self.proc, None
-        if proc and proc.returncode is None:
-            logger.debug(f"LSP stopping: {self.ext} @ {self.root}")
-            try:
-                self._send_raw("shutdown", {}, is_notify=False, msg_id=0)
-                self._send_raw("exit", None, is_notify=True)
-                await asyncio.wait_for(proc.wait(), timeout=3)
+    async def _drain_stderr(self) -> None:
+        proc = self.proc
+        if not proc or not proc.stderr:
+            return
+        while True:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
                 return
-            except Exception as exc:  # noqa: BLE001 - 关闭阶段任何失败都要兜住并继续 kill
-                logger.debug(f"LSP graceful shutdown failed, killing: {exc}")
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+            self._stderr.extend(chunk)
+            if len(self._stderr) > LSP_STDERR_CAP:
+                del self._stderr[:-LSP_STDERR_CAP]
+
+    def _process_error(self, method: str) -> RuntimeError:
+        code = self.proc.returncode if self.proc else None
+        message = f"LSP {method} 失败：语言服务器连接已关闭"
+        if code is not None:
+            message += f"（退出码 {code}）"
+        detail = self._stderr.decode("utf-8", errors="replace").strip()
+        if detail:
+            message += f"\nstderr 末尾：\n{detail[-4000:]}"
+        return RuntimeError(message)
+
+    async def stop(self) -> None:
+        proc = self.proc
+        if not proc:
+            return
+        try:
+            if proc.returncode is None:
+                logger.debug(f"LSP stopping: {self.ext} @ {self.root}")
+                try:
+                    await self._request("shutdown", {}, timeout=3)
+                    await self._notify("exit", None)
+                    await asyncio.wait_for(proc.wait(), timeout=3)
+                except Exception as exc:  # noqa: BLE001 - 关闭失败时仍需终止并释放进程
+                    logger.debug(f"LSP graceful shutdown failed, killing: {exc}")
+                    with contextlib.suppress(ProcessLookupError):
+                        proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=3)
+        finally:
+            self.proc = None
+            if proc.stdin:
+                proc.stdin.close()
+            transport = getattr(proc, "_transport", None)
+            if transport:
+                transport.close()
+            task, self._stderr_task = self._stderr_task, None
+            if task:
+                with contextlib.suppress(asyncio.TimeoutError, OSError):
+                    await asyncio.wait_for(task, timeout=1)
 
     # ---- 协议底层 ----
 
@@ -230,8 +293,10 @@ class LSPClient:
 
     async def _request(self, method: str, params, timeout: float = 60):
         async with self._lock:
-            if not (self.proc and self.proc.returncode is None and self.proc.stdout):
+            if not self.proc or not self.proc.stdout:
                 raise RuntimeError("服务器进程未运行")
+            if self.proc.returncode is not None:
+                raise self._process_error(method)
             self._next_id += 1
             msg_id = self._next_id
             self.last_used = time.monotonic()
@@ -245,13 +310,19 @@ class LSPClient:
                         f"LSP {method} timed out after {timeout}s (root={self.root})"
                     )
                     raise TimeoutError(f"{method} 响应超时（{timeout}s）")
-                header = await asyncio.wait_for(
-                    self.proc.stdout.readuntil(b"\r\n\r\n"), timeout=remaining
-                )
-                match = re.search(rb"Content-Length: (\d+)", header)
-                body = await asyncio.wait_for(
-                    self.proc.stdout.readexactly(int(match.group(1))), timeout=remaining
-                )
+                try:
+                    header = await asyncio.wait_for(
+                        self.proc.stdout.readuntil(b"\r\n\r\n"), timeout=remaining
+                    )
+                    match = re.search(rb"Content-Length: (\d+)", header)
+                    if not match:
+                        raise RuntimeError(f"LSP {method} 响应缺少 Content-Length")
+                    body = await asyncio.wait_for(
+                        self.proc.stdout.readexactly(int(match.group(1))),
+                        timeout=remaining,
+                    )
+                except asyncio.IncompleteReadError as exc:
+                    raise self._process_error(method) from exc
                 message = json.loads(body.decode("utf-8", errors="replace"))
                 if message.get("id") != msg_id:
                     continue  # 服务器通知/服务端请求，检索场景不需要，直接丢
@@ -350,6 +421,7 @@ class LSPManager:
                 logger.warning(
                     f"LSP process died (code={code}), respawning: {ext} @ {root}"
                 )
+                await client.stop()
             argv, tried = probe(ext, overrides)
             if argv is None:
                 raise RuntimeError(no_server_msg(ext, tried))
@@ -380,6 +452,9 @@ class LSPManager:
     async def shutdown(self) -> None:
         if self._reaper:
             self._reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reaper
+            self._reaper = None
         for client in list(self._clients.values()):
             try:
                 await client.stop()

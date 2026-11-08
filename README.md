@@ -37,11 +37,13 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 
 | 工具 | 功能 |
 |------|------|
-| `self_search` | 目录内 grep：`mode=content`（命中行，默认）/ `files`（命中文件）/ `count`（每文件计数）；支持正则、大小写、`context_lines` 前后文、`offset` 翻页、`exclude_glob` 排除；`files` 模式按访问频率排序并标注常用文件；头部给出「还剩多少条、估计还需几页」 |
+| `self_search` | 目录内 grep：`mode=content`（命中行，默认）/ `files`（命中文件）/ `count`（每文件计数）；支持正则、大小写、前后文、分页、排除模式；`file_glob` 支持文件名、相对路径和逗号分隔的多个模式；空结果区分无候选文件、无内容命中与扫描不完整 |
 | `self_read` | 读文件（带行号）；`start_line`/`end_line` 指定行区间（`end_line` 负数从末尾倒数，`-1` = 最后一行）；头部给出「还剩多少行/约多少字符/估计还需几次」，末尾给出精确续读参数；`files` 数组一次最多批量读 8 个，共享输出预算，逐文件报错 |
-| `self_glob` | 按文件名通配符列文件（如 `*.cs`、`Card*.cs`） |
+| `self_glob` | 按文件名或相对路径通配符列文件，支持逗号分隔的多个模式 |
 
 ### LSP 语义级（需要环境里有对应语言服务器）
+
+C# 使用 `csharp-ls` 时，数据源内必须至少有一个 `.sln`、`.csproj` 或 `.fsproj` 文件；子目录中的项目文件也可被识别。
 
 | 工具 | 功能 |
 |------|------|
@@ -92,6 +94,7 @@ astrbot_plugin_self_file_search/
 ├── lsp.py                           # 通用 LSP 后端：探测表 / 进程管理 / JSON-RPC
 ├── metadata.yaml                    # 插件元数据
 ├── _conf_schema.json                # 插件配置 Schema
+├── tests/                           # 标准库 unittest 回归测试
 ├── CHANGELOG.md
 └── README.md
 ```
