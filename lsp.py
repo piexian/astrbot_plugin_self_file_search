@@ -256,7 +256,7 @@ def resolve_root(source_root: str, path: str | None, server: str, ext: str) -> s
         found = _nearest_marker_root(source_root, path, markers)
         if found:
             return found
-    return source_root
+    return os.path.realpath(source_root)
 
 
 def _configuration_value(settings: dict, section: str | None):
