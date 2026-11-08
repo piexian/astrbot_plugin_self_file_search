@@ -315,6 +315,23 @@ def _parse_excludes(raw) -> list[str]:
     return out
 
 
+def _parse_file_globs(raw) -> list[str]:
+    """file_glob：逗号分隔，支持文件名或数据源相对路径模式。"""
+    patterns = [p.strip().replace("\\", "/") for p in str(raw or "").split(",")]
+    return [p for p in patterns if p] or ["*"]
+
+
+def _matches_file_globs(rel: str, patterns: list[str]) -> bool:
+    """纯文件名模式匹配 basename，含目录的模式匹配相对路径。"""
+    rel = rel.replace("\\", "/")
+    base = rel.rsplit("/", 1)[-1]
+    for pattern in patterns:
+        target = rel if "/" in pattern else base
+        if fnmatch(target, pattern):
+            return True
+    return False
+
+
 def _is_excluded(rel: str, exclude: list[str]) -> bool:
     """相对路径或其任一路径段命中排除模式则跳过。"""
     base = rel.rsplit("/", 1)[-1]
@@ -375,7 +392,7 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 },
                 "file_glob": {
                     "type": "string",
-                    "description": "Optional filename glob filter, e.g. *.cs; default all files",
+                    "description": "Optional filename or relative-path globs, comma-separated; default all files",
                 },
                 "exclude_glob": {
                     "type": "string",
@@ -440,7 +457,7 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             if mode == "content"
             else 0
         )
-        glob = str(kwargs.get("file_glob", "")).strip() or "*"
+        globs = _parse_file_globs(kwargs.get("file_glob"))
         exclude = _parse_excludes(kwargs.get("exclude_glob"))
 
         # 收集每个文件的命中行号（含行文本），扫描由文件数/时限双封顶
@@ -448,6 +465,7 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         order: list[str] = []
         total = 0
         scanned = 0
+        candidate_files = 0
         deadline = time.monotonic() + SEARCH_TIMEOUT_SECONDS
         incomplete = False
         for dirpath, dirnames, filenames in os.walk(root):
@@ -456,13 +474,14 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 if scanned >= MAX_SCAN_FILES or time.monotonic() > deadline:
                     incomplete = True
                     break
-                if not fnmatch(fn, glob):
+                rel = os.path.relpath(os.path.join(dirpath, fn), root).replace(
+                    "\\", "/"
+                )
+                if not _matches_file_globs(rel, globs):
                     continue
-                if exclude and _is_excluded(
-                    os.path.relpath(os.path.join(dirpath, fn), root).replace("\\", "/"),
-                    exclude,
-                ):
+                if exclude and _is_excluded(rel, exclude):
                     continue
+                candidate_files += 1
                 path = os.path.join(dirpath, fn)
                 try:
                     if os.path.getsize(path) > MAX_FILE_BYTES:
@@ -470,7 +489,6 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                     lines = await asyncio.to_thread(_read_lines, path)
                     for i, line in enumerate(lines, 1):
                         if rx.search(line):
-                            rel = os.path.relpath(path, root).replace("\\", "/")
                             if rel not in matches:
                                 matches[rel] = {}
                                 order.append(rel)
@@ -528,7 +546,17 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 f"（offset={offset + len(entries)} 起）"
             )
         if not entries:
-            return f"{head}，无可命中内容。"
+            if order:
+                return f"{head}，本页无内容，请检查 offset。"
+            if candidate_files == 0:
+                if incomplete:
+                    return f"{head}，扫描不完整，尚不能确定是否有候选文件或内容命中。"
+                return f"{head}，文件过滤后没有候选文件，请检查 file_glob/exclude_glob；可用 self_glob 确认路径。"
+            if incomplete:
+                return f"{head}，已扫描 {scanned}/{candidate_files} 个候选文件，当前无命中；扫描不完整，不能据此认定内容不存在。"
+            return (
+                f"{head}，已扫描 {scanned}/{candidate_files} 个候选文件，文件内无命中。"
+            )
         body = "\n".join(entries)
         if len(head) + len(body) > SEARCH_OUTPUT_CAP:
             shown = len(entries)
@@ -862,9 +890,10 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
 class SelfGlobTool(FunctionTool[AstrAgentContext]):
     name: str = "self_glob"
     description: str = (
-        "List files inside a whitelisted data source by filename glob (e.g. *.cs, "
-        "Card*.cs, *Trait*). Use it to confirm a path when you know the filename or "
-        "to browse structure; use self_search to find code by content."
+        "List files inside a whitelisted data source by filename or relative-path "
+        "globs (e.g. *.cs, versions/lang/Thing.json); comma-separated patterns are "
+        "supported. Use it to confirm a path or browse structure; use self_search "
+        "to find code by content."
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -873,7 +902,7 @@ class SelfGlobTool(FunctionTool[AstrAgentContext]):
                 "source": {"type": "string", "description": "Data source name"},
                 "pattern": {
                     "type": "string",
-                    "description": "Filename glob, e.g. *.cs; default * (all files)",
+                    "description": "Filename or relative-path globs, comma-separated; default * (all files)",
                 },
                 "max": {
                     "type": "integer",
@@ -893,7 +922,7 @@ class SelfGlobTool(FunctionTool[AstrAgentContext]):
         if isinstance(picked, str):
             return picked
         src, root = picked
-        pattern = str(kwargs.get("pattern", "")).strip() or "*"
+        patterns = _parse_file_globs(kwargs.get("pattern"))
         limit = max(1, min(int(kwargs.get("max", 100) or 100), 500))
         rels: list[str] = []
         scanned = 0
@@ -905,10 +934,12 @@ class SelfGlobTool(FunctionTool[AstrAgentContext]):
                 if scanned >= MAX_SCAN_FILES or time.monotonic() > deadline:
                     incomplete = True
                     break
-                if not fnmatch(fn, pattern):
+                rel = os.path.relpath(os.path.join(dirpath, fn), root).replace(
+                    "\\", "/"
+                )
+                if not _matches_file_globs(rel, patterns):
                     continue
-                path = os.path.join(dirpath, fn)
-                rels.append(os.path.relpath(path, root).replace("\\", "/"))
+                rels.append(rel)
                 scanned += 1
             if incomplete:
                 break
@@ -942,7 +973,8 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
         "Search workspace symbols (classes/methods/fields/enums) via the language "
         "server — semantically more precise than plain-text search. Requires an LSP "
         "server for the language on PATH; on first call the server may still be "
-        "indexing, so retry if the result is empty."
+        "indexing, so retry if the result is empty. csharp-ls also requires a "
+        ".sln/.csproj/.fsproj file under the source."
     )
     parameters: dict = Field(
         default_factory=lambda: {
