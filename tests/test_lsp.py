@@ -226,8 +226,8 @@ class ServerAdapterTests(unittest.IsolatedAsyncioTestCase):
             )
             fallback = lsp.resolve_root(str(source), str(source_file), "unknown", "txt")
 
-            self.assertEqual(selected, str(project))
-            self.assertEqual(fallback, str(source))
+            self.assertEqual(selected, os.path.realpath(project))
+            self.assertEqual(fallback, os.path.realpath(source))
 
     def test_gopls_prefers_go_work_over_nested_module(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -241,7 +241,7 @@ class ServerAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             selected = lsp.resolve_root(str(source), str(source_file), "gopls", "go")
 
-            self.assertEqual(selected, str(source))
+            self.assertEqual(selected, os.path.realpath(source))
 
     def test_initialize_declares_only_supported_workspace_behaviour(self):
         client = lsp.LSPClient(

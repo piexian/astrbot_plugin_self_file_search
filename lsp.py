@@ -310,7 +310,7 @@ async def _kill_process_tree(proc) -> None:
                 f"LSP taskkill failed (code={killer.returncode}): "
                 f"{stderr.decode('utf-8', errors='replace').strip()}"
             )
-        except (OSError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, OSError) as exc:
             logger.debug(f"LSP taskkill unavailable: {exc}")
     with contextlib.suppress(ProcessLookupError):
         proc.kill()
