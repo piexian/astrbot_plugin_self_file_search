@@ -217,8 +217,12 @@ def _executable_name(argv: list[str]) -> str:
     return name
 
 
+SERVER_ALIASES = {"pyright-langserver": "pyright"}
+
+
 def server_id(argv: list[str], ext: str) -> str:
-    return _executable_name(argv) or ext
+    name = _executable_name(argv)
+    return SERVER_ALIASES.get(name, name or ext)
 
 
 def _has_marker(directory: str, marker: str) -> bool:

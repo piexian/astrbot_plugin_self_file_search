@@ -243,6 +243,35 @@ class ServerAdapterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(selected, os.path.realpath(source))
 
+    async def test_pyright_executable_uses_canonical_root_and_config_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            project = source / "nested"
+            source_file = project / "src" / "app.py"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text("value = 1\n", encoding="utf-8")
+            (project / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+            manager = lsp.LSPManager()
+            initialization = {"pyright": {"python": {"pythonPath": "python"}}}
+            with (
+                patch.object(
+                    lsp, "probe", return_value=(["pyright-langserver", "--stdio"], [])
+                ),
+                patch.object(lsp.LSPClient, "start", new=AsyncMock()),
+            ):
+                client = await manager.get(
+                    str(source),
+                    "py",
+                    {},
+                    path=str(source_file),
+                    initialization=initialization,
+                )
+
+            self.assertEqual(client.server, "pyright")
+            self.assertEqual(client.root, os.path.realpath(project))
+            self.assertEqual(client.initialization, initialization["pyright"])
+            await manager.shutdown()
+
     def test_initialize_declares_only_supported_workspace_behaviour(self):
         client = lsp.LSPClient(
             "/tmp", "cs", ["csharp-ls"], initialization={"csharp": {"x": 1}}
