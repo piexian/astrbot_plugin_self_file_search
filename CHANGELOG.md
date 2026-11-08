@@ -2,6 +2,12 @@
 
 本项目遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+
+## [1.0.4] - 2026-11-09
+
+- 修复 `file_glob` 相对路径匹配，`self_search` / `self_glob` 支持逗号分隔的多个模式。
+- 空结果区分无候选文件、文件内无命中、扫描不完整和分页越界。
+- `csharp-ls` 缺少项目文件时明确报错，进程异常保留 stderr 摘要；修复关闭流程与管道资源释放。
 ## [1.0.3] - 2026-10-13
 
 - 修正插件元数据字段名以符合 AstrBot 规范（`description` → `desc`，`repository` → `repo`），补充 `short_desc` 与 `astrbot_version`。
