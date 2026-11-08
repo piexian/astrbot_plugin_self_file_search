@@ -11,7 +11,7 @@
 |------|----------|
 | Python | >= 3.10 |
 | AstrBot | >= 4.10.4（template_list 条目配置） |
-| LSP 服务器（可选） | 从系统 PATH 自动探测，如 `csharp-ls` / `gopls` / `rust-analyzer` |
+| LSP 服务器（可选） | 从系统 PATH 自动探测，如 `roslyn-language-server` / `csharp-ls` / `gopls` |
 
 ## 功能
 
@@ -43,7 +43,7 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 
 ### LSP 语义级（需要环境里有对应语言服务器）
 
-C# 使用 `csharp-ls` 时，数据源内必须至少有一个 `.sln`、`.csproj` 或 `.fsproj` 文件。插件不自动安装服务器；各服务器可能按自身机制生成索引或缓存。
+C# 默认优先 `roslyn-language-server --stdio --autoLoadProjects`，未安装时回退 `csharp-ls`。两者都需要数据源内至少一个 `.sln`、`.csproj` 或 `.fsproj` 文件。插件不自动安装服务器；各服务器可能按自身机制生成索引或缓存。
 
 | 工具 | 功能 |
 |------|------|

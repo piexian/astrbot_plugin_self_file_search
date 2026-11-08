@@ -7,6 +7,7 @@
 ## [1.1.0] - 2026-11-09
 
 - 按服务器和文件发现项目根目录，`self_symbols` 支持可选 `path` 建立文件上下文。
+- C# 默认优先 Roslyn Language Server，未安装时回退 `csharp-ls`；兼容 Roslyn 的编码盘符 URI。
 - 新增 `lsp_initialization`，补齐 workspace 能力声明与服务端配置/进度/工作区请求响应。
 - Windows 隐藏控制台并在强制关闭时清理进程树；启动或进程故障后熔断，避免反复崩溃。
 - 单元测试覆盖 Linux、Windows、macOS，包含 Windows 带空格 `.cmd` 启动回归。

@@ -80,18 +80,32 @@ class ProjectDetectionTests(unittest.TestCase):
         self.assertFalse(lsp._is_csharp_ls(["omnisharp", "-lsp"]))
         self.assertFalse(lsp._is_csharp_ls([]))
 
+    def test_roslyn_is_the_default_csharp_server(self):
+        self.assertEqual(
+            lsp.LSP_CANDIDATES["cs"][0],
+            ["roslyn-language-server", "--stdio", "--autoLoadProjects"],
+        )
+        self.assertEqual(lsp.LSP_CANDIDATES["cs"][1], ["csharp-ls"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows drive URI regression")
+    def test_roslyn_lowercase_encoded_drive_uri_is_normalized(self):
+        uri = "file:///c%3A/Users/Test/Project/Quest.cs"
+        expected = os.path.realpath(r"C:\Users\Test\Project\Quest.cs")
+        self.assertEqual(lsp.uri_to_path(uri), expected)
+
 
 class LspClientTests(unittest.IsolatedAsyncioTestCase):
     def make_client(self, root="/tmp"):
         return lsp.LSPClient(root, "cs", ["csharp-ls"])
 
     async def test_missing_project_fails_before_spawning(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            client = self.make_client(tmp)
-            with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as spawn:
-                with self.assertRaisesRegex(RuntimeError, "csproj"):
-                    await client.start()
-            spawn.assert_not_awaited()
+        for argv in (["csharp-ls"], ["roslyn-language-server"]):
+            with self.subTest(argv=argv), tempfile.TemporaryDirectory() as tmp:
+                client = lsp.LSPClient(tmp, "cs", argv)
+                with patch("asyncio.create_subprocess_exec", new=AsyncMock()) as spawn:
+                    with self.assertRaisesRegex(RuntimeError, "csproj"):
+                        await client.start()
+                spawn.assert_not_awaited()
 
     async def test_valid_response_frame_is_decoded(self):
         reader = asyncio.StreamReader()

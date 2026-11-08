@@ -13,13 +13,16 @@ import shutil
 import subprocess
 import time
 import urllib.parse
-import urllib.request
 
 from astrbot.api import logger
 
 # 扩展名 -> 候选命令行（按优先级），PATH 里探测到哪个用哪个
 LSP_CANDIDATES: dict[str, list[list[str]]] = {
-    "cs": [["csharp-ls"], ["omnisharp", "-lsp"]],
+    "cs": [
+        ["roslyn-language-server", "--stdio", "--autoLoadProjects"],
+        ["csharp-ls"],
+        ["omnisharp", "-lsp"],
+    ],
     "go": [["gopls"]],
     "rs": [["rust-analyzer"]],
     "ts": [["typescript-language-server", "--stdio"]],
@@ -150,10 +153,12 @@ def _path_to_uri(path: str) -> str:
 
 
 def uri_to_path(uri: str) -> str:
-    path = urllib.request.url2pathname(urllib.parse.urlparse(uri).path)
+    path = urllib.parse.unquote(urllib.parse.urlparse(uri).path)
     if re.match(r"^/[A-Za-z]:", path):
         path = path[1:]
-    return path
+    if os.name == "nt":
+        path = path.replace("/", "\\")
+    return os.path.realpath(path)
 
 
 def to_utf16_char(line_text: str, py_char: int) -> int:
@@ -171,6 +176,7 @@ def no_server_msg(ext: str, tried: list[str]) -> str:
 
 ROOT_MARKER_GROUPS: dict[str, tuple[tuple[str, ...], ...]] = {
     "csharp-ls": (("*.sln", "*.slnx", "*.csproj", "global.json"),),
+    "roslyn-language-server": (("*.sln", "*.slnx", "*.csproj", "global.json"),),
     "omnisharp": (("*.sln", "*.slnx", "*.csproj", "omnisharp.json", "global.json"),),
     "gopls": (("go.work",), ("go.mod", "go.sum")),
     "rust-analyzer": (("Cargo.toml", "Cargo.lock", "rust-project.json"),),
@@ -322,6 +328,7 @@ async def _kill_process_tree(proc) -> None:
 
 LSP_STDERR_CAP = 16000
 LSP_PROJECT_SUFFIXES = (".sln", ".csproj", ".fsproj")
+CSHARP_PROJECT_SERVERS = {"csharp-ls", "roslyn-language-server"}
 
 
 def _is_csharp_ls(argv: list[str]) -> bool:
@@ -379,9 +386,9 @@ class LSPClient:
         return params
 
     async def start(self) -> None:
-        if _is_csharp_ls(self.argv) and not _has_csharp_project(self.root):
+        if self.server in CSHARP_PROJECT_SERVERS and not _has_csharp_project(self.root):
             raise RuntimeError(
-                f"csharp-ls 需要数据源内至少一个 .sln/.csproj/.fsproj 文件：{self.root}"
+                f"{self.server} 需要数据源内至少一个 .sln/.csproj/.fsproj 文件：{self.root}"
             )
         started = time.monotonic()
         logger.debug(f"LSP spawning: {self.argv} (root={self.root})")
