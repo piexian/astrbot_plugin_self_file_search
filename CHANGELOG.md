@@ -4,7 +4,7 @@
 
 
 
-## [Unreleased]
+## [1.1.1] - 2026-11-12
 
 - Roslyn `self_symbols` 对未就绪的首次空结果等待 `workspace/projectInitializationComplete`，在 90 秒总预算内仅重查一次，超时直接报告。
 - 修复就绪通知与空响应的竞态，保留超时接收帧状态；活动查询不参与空闲回收，初始化和进程清理由管理器统一持有。
