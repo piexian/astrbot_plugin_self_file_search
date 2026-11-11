@@ -304,7 +304,11 @@ class SymbolToolBudgetTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(result.startswith("error:"))
                 self.assertIn(expected, result)
                 self.assertNotIn("命中 0 条", result)
-                self.assertLessEqual(client.symbols.await_count, 1)
+                initialize.assert_awaited_once()
+                if ready is None:
+                    client.symbols.assert_not_awaited()
+                else:
+                    client.symbols.assert_awaited_once()
 
     async def test_both_timeout_types_preserve_project_loading_phase(self):
         for error_type in (TimeoutError, asyncio.TimeoutError):

@@ -363,10 +363,21 @@ class LSPClient:
         self.proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._next_id = 0
+        self._body_length: int | None = None
+        self._active_operations = 0
         self._opened: set[str] = set()
         self._stderr = bytearray()
         self._stderr_task: asyncio.Task | None = None
         self.last_used = time.monotonic()
+
+    @contextlib.contextmanager
+    def _operation(self):
+        self._active_operations += 1
+        try:
+            yield
+        finally:
+            self._active_operations -= 1
+            self.last_used = time.monotonic()
 
     def _initialize_params(self) -> dict:
         workspace: dict = {"configuration": True}
@@ -397,23 +408,19 @@ class LSPClient:
         logger.debug(f"LSP spawning: {self.argv} (root={self.root})")
         self.proc = await _spawn_lsp_process(self.argv, self.root)
         self._stderr_task = asyncio.create_task(self._drain_stderr())
-        try:
-            result = await self._request(
-                "initialize",
-                self._initialize_params(),
-                timeout=60,
+        result = await self._request(
+            "initialize",
+            self._initialize_params(),
+            timeout=60,
+        )
+        if result is None:
+            raise RuntimeError("initialize 失败")
+        await self._notify("initialized", {})
+        if self.initialization:
+            await self._notify(
+                "workspace/didChangeConfiguration",
+                {"settings": self.initialization},
             )
-            if result is None:
-                raise RuntimeError("initialize 失败")
-            await self._notify("initialized", {})
-            if self.initialization:
-                await self._notify(
-                    "workspace/didChangeConfiguration",
-                    {"settings": self.initialization},
-                )
-        except (Exception, asyncio.CancelledError):
-            await self.stop()
-            raise
         logger.debug(
             f"LSP initialized: {self.ext} @ {self.root} in {time.monotonic() - started:.1f}s"
         )
@@ -523,24 +530,25 @@ class LSPClient:
         self._send_raw(method, params, is_notify=True)
         await self.proc.stdin.drain()
 
-    async def _read_message(self, method: str, timeout: float) -> dict:
-        if not self.proc or not self.proc.stdout:
-            raise RuntimeError("服务器进程未运行")
-        deadline = time.monotonic() + timeout
-        try:
-            header = await asyncio.wait_for(
-                self.proc.stdout.readuntil(b"\r\n\r\n"), timeout=timeout
-            )
+    async def _read_frame(self, method: str) -> dict:
+        reader = self.proc.stdout
+        if self._body_length is None:
+            header = await reader.readuntil(b"\r\n\r\n")
             match = re.search(rb"Content-Length: (\d+)", header)
             if not match:
                 raise RuntimeError(f"LSP {method} 响应缺少 Content-Length")
-            body = await asyncio.wait_for(
-                self.proc.stdout.readexactly(int(match.group(1))),
-                timeout=max(0, deadline - time.monotonic()),
-            )
+            self._body_length = int(match.group(1))
+        body = await reader.readexactly(self._body_length)
+        self._body_length = None
+        return json.loads(body.decode("utf-8", errors="replace"))
+
+    async def _read_message(self, method: str, timeout: float) -> dict:
+        if not self.proc or not self.proc.stdout:
+            raise RuntimeError("服务器进程未运行")
+        try:
+            return await asyncio.wait_for(self._read_frame(method), timeout=timeout)
         except asyncio.IncompleteReadError as exc:
             raise self._process_error(method) from exc
-        return json.loads(body.decode("utf-8", errors="replace"))
 
     async def _handle_server_message(self, message: dict) -> None:
         if "id" in message:
@@ -622,26 +630,28 @@ class LSPClient:
         self._opened.add(uri)
 
     async def symbols(self, query: str, timeout: float = 90, path: str | None = None):
-        try:
-            return await asyncio.wait_for(
-                self._symbols(query, timeout, path), timeout=timeout
-            )
-        except LSP_TIMEOUT_ERRORS as exc:
-            if not self.workspace_ready:
-                raise TimeoutError(
-                    "Roslyn 项目加载尚未完成，符号查询等待超时。"
-                ) from exc
-            raise TimeoutError("workspace/symbol 查询超时。") from exc
+        with self._operation():
+            try:
+                return await asyncio.wait_for(
+                    self._symbols(query, timeout, path), timeout=timeout
+                )
+            except LSP_TIMEOUT_ERRORS as exc:
+                if not self.workspace_ready:
+                    raise TimeoutError(
+                        "Roslyn 项目加载尚未完成，符号查询等待超时。"
+                    ) from exc
+                raise TimeoutError("workspace/symbol 查询超时。") from exc
 
     async def _symbols(self, query: str, timeout: float, path: str | None):
         deadline = time.monotonic() + timeout
         if path:
             await self._ensure_open(path)
         params = {"query": query}
+        ready_before_query = self.workspace_ready
         result = await self._request(
             "workspace/symbol", params, timeout=max(0, deadline - time.monotonic())
         )
-        if result or self.workspace_ready:
+        if result or ready_before_query:
             return result
         await self._wait_workspace_ready(deadline)
         return await self._request(
@@ -649,37 +659,42 @@ class LSPClient:
         )
 
     async def definition(self, path: str, line0: int, char: int):
-        await self._ensure_open(path)
-        return await self._request(
-            "textDocument/definition",
-            {
-                "textDocument": {"uri": _path_to_uri(path)},
-                "position": {"line": line0, "character": char},
-            },
-        )
+        with self._operation():
+            await self._ensure_open(path)
+            return await self._request(
+                "textDocument/definition",
+                {
+                    "textDocument": {"uri": _path_to_uri(path)},
+                    "position": {"line": line0, "character": char},
+                },
+            )
 
     async def references(
         self, path: str, line0: int, char: int, include_decl: bool = False
     ):
-        await self._ensure_open(path)
-        return await self._request(
-            "textDocument/references",
-            {
-                "textDocument": {"uri": _path_to_uri(path)},
-                "position": {"line": line0, "character": char},
-                "context": {"includeDeclaration": include_decl},
-            },
-        )
+        with self._operation():
+            await self._ensure_open(path)
+            return await self._request(
+                "textDocument/references",
+                {
+                    "textDocument": {"uri": _path_to_uri(path)},
+                    "position": {"line": line0, "character": char},
+                    "context": {"includeDeclaration": include_decl},
+                },
+            )
 
 
 class LSPManager:
-    """按 (root, ext) 管理客户端；空闲自动关闭。"""
+    """按 (root, server) 共享初始化和客户端，统一回收进程。"""
 
     def __init__(self, idle_minutes: int = 10):
         self.idle_minutes = idle_minutes
         self._clients: dict[tuple[str, str], LSPClient] = {}
         self._locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._broken: dict[tuple[str, str], str] = {}
+        self._starting: dict[tuple[str, str], asyncio.Task] = {}
+        self._stopping: set[asyncio.Task] = set()
+        self._shutting_down = False
         self._reaper: asyncio.Task | None = None
 
     def _lock_for(self, key: tuple[str, str]) -> asyncio.Lock:
@@ -704,6 +719,8 @@ class LSPManager:
         options = configs[server] if server in configs else configs.get(ext, {})
         key = (root, server)
         async with self._lock_for(key):
+            if self._shutting_down:
+                raise RuntimeError("LSP 正在关闭，请稍后重试。")
             if key in self._broken:
                 raise RuntimeError(
                     f"LSP 已标记不可用，请修正后重载插件：{self._broken[key]}"
@@ -713,20 +730,59 @@ class LSPManager:
                 return client
             if client is not None:
                 code = client.proc.returncode if client.proc else "none"
-                await client.stop()
                 self._clients.pop(key, None)
+                self._schedule_stop(client)
                 error = f"LSP 进程已退出（code={code}）：{server} @ {root}"
                 self._broken[key] = error
                 raise RuntimeError(error)
-            client = LSPClient(root, ext, argv, server=server, initialization=options)
-            try:
-                await client.start()
-            except Exception as exc:
-                self._broken[key] = str(exc)
-                raise
-            self._clients[key] = client
-            self._ensure_reaper()
-            return client
+            task = self._starting.get(key)
+            if task is None:
+                client = LSPClient(
+                    root, ext, argv, server=server, initialization=options
+                )
+                task = asyncio.create_task(self._start_client(key, client))
+                self._starting[key] = task
+                task.add_done_callback(lambda done: self._finish_start(key, done))
+        # 调用方超时只取消等待，初始化和清理由管理器收尾。
+        return await asyncio.shield(task)
+
+    async def _start_client(self, key: tuple[str, str], client: LSPClient):
+        try:
+            await client.start()
+        except asyncio.CancelledError:
+            self._schedule_stop(client)
+            raise
+        except Exception as exc:
+            detail = f"{client.server} 初始化失败：{type(exc).__name__}: {exc}"
+            self._broken[key] = detail
+            self._schedule_stop(client)
+            raise RuntimeError(detail) from exc
+        client.last_used = time.monotonic()
+        self._clients[key] = client
+        self._ensure_reaper()
+        return client
+
+    def _finish_start(self, key: tuple[str, str], task: asyncio.Task) -> None:
+        if self._starting.get(key) is task:
+            self._starting.pop(key)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.warning(f"LSP startup failed: {key[1]} @ {key[0]}: {error!r}")
+
+    def _schedule_stop(self, client: LSPClient) -> None:
+        task = asyncio.create_task(self._stop_client(client))
+        self._stopping.add(task)
+        task.add_done_callback(self._stopping.discard)
+
+    async def _stop_client(self, client: LSPClient) -> None:
+        try:
+            await client.stop()
+        except Exception as exc:
+            logger.warning(
+                f"LSP cleanup failed: {client.server} @ {client.root}: {exc!r}"
+            )
 
     def _ensure_reaper(self) -> None:
         if self._reaper and not self._reaper.done():
@@ -738,24 +794,35 @@ class LSPManager:
             await asyncio.sleep(60)
             now = time.monotonic()
             for key, client in list(self._clients.items()):
-                if now - client.last_used > self.idle_minutes * 60:
-                    logger.debug(f"LSP idle close: {key[1]} @ {key[0]}")
-                    self._clients.pop(key, None)
-                    try:
-                        await client.stop()
-                    except Exception as exc:  # noqa: BLE001 - 回收阶段兜住，不影响其他客户端
-                        logger.debug(f"LSP idle close failed: {exc}")
+                async with self._lock_for(key):
+                    if client._active_operations or client._lock.locked():
+                        continue
+                    if now - client.last_used > self.idle_minutes * 60:
+                        logger.debug(f"LSP idle close: {key[1]} @ {key[0]}")
+                        self._clients.pop(key, None)
+                        self._schedule_stop(client)
 
     async def shutdown(self) -> None:
-        if self._reaper:
-            self._reaper.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._reaper
-            self._reaper = None
-        for client in list(self._clients.values()):
-            try:
-                await client.stop()
-            except Exception as exc:  # noqa: BLE001 - 卸载阶段兜住，保证全部清理
-                logger.debug(f"LSP shutdown failed: {exc}")
-        self._clients.clear()
-        self._broken.clear()
+        self._shutting_down = True
+        try:
+            if self._reaper:
+                self._reaper.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._reaper
+                self._reaper = None
+            starting = list(self._starting.values())
+            for task in starting:
+                task.cancel()
+            if starting:
+                await asyncio.gather(*starting, return_exceptions=True)
+            self._starting.clear()
+            for client in list(self._clients.values()):
+                self._schedule_stop(client)
+            self._clients.clear()
+            if self._stopping:
+                await asyncio.shield(
+                    asyncio.gather(*list(self._stopping), return_exceptions=True)
+                )
+            self._broken.clear()
+        finally:
+            self._shutting_down = False

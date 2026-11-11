@@ -43,7 +43,9 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 
 ### LSP 语义级（需要环境里有对应语言服务器）
 
-C# 默认优先 `roslyn-language-server --stdio --autoLoadProjects`，未安装时回退 `csharp-ls`。两者都需要数据源内至少一个 `.sln`、`.csproj` 或 `.fsproj` 文件。插件不自动安装服务器；服务器可能按自身机制生成索引或缓存。Roslyn 的 `self_symbols` 遇到未就绪的首次空结果时，在 90 秒总预算内等待就绪后仅重查一次。
+C# 默认优先 `roslyn-language-server --stdio --autoLoadProjects`，未安装时回退 `csharp-ls`。两者都需要数据源内至少一个 `.sln`、`.csproj` 或 `.fsproj` 文件。插件不自动安装服务器；服务器可能按自身机制生成索引或缓存。
+
+Roslyn `self_symbols` 对发起时未就绪的首次空结果等待就绪后重查一次，初始化与查询共用 90 秒预算；超时后保留初始化供后续调用复用，活动查询不参与空闲回收。
 
 | 工具 | 功能 |
 |------|------|
