@@ -360,9 +360,11 @@ class ServerAdapterTests(unittest.IsolatedAsyncioTestCase):
         await client.symbols("Quest", path="/tmp/Quest.cs")
 
         client._ensure_open.assert_awaited_once_with("/tmp/Quest.cs")
-        client._request.assert_awaited_once_with(
-            "workspace/symbol", {"query": "Quest"}, timeout=90
-        )
+        client._request.assert_awaited_once()
+        call = client._request.await_args
+        self.assertEqual(call.args, ("workspace/symbol", {"query": "Quest"}))
+        self.assertGreater(call.kwargs["timeout"], 0)
+        self.assertLessEqual(call.kwargs["timeout"], 90)
 
     async def test_start_failure_is_not_retried_until_shutdown(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -413,6 +415,146 @@ class ServerAdapterTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(proc.communicate(), timeout=5)
 
             self.assertEqual(proc.returncode, 0)
+
+
+class RoslynReadinessTests(unittest.IsolatedAsyncioTestCase):
+    def make_client(self, *messages, server="roslyn-language-server", eof=False):
+        reader = asyncio.StreamReader()
+        for message in messages:
+            reader.feed_data(lsp.LSPClient._frame(message))
+        if eof:
+            reader.feed_eof()
+        client = lsp.LSPClient("/tmp", "cs", [server])
+        client.proc = FakeProcess(stdout=reader)
+        return client, reader
+
+    def reply(self, number, result):
+        return {"jsonrpc": "2.0", "id": number, "result": result}
+
+    def ready(self):
+        return {"jsonrpc": "2.0", "method": "workspace/projectInitializationComplete"}
+
+    def requests(self, client):
+        return [
+            message
+            for message in decode_frames(bytes(client.proc.stdin.data))
+            if message.get("method") == "workspace/symbol"
+        ]
+
+    async def test_cold_empty_waits_for_ready_and_retries_once(self):
+        hit = [{"name": "Quest"}]
+        client, _ = self.make_client(
+            self.reply(1, []),
+            {
+                "jsonrpc": "2.0",
+                "id": "config",
+                "method": "workspace/configuration",
+                "params": {"items": [{"section": "project"}]},
+            },
+            self.ready(),
+            self.reply(2, hit),
+        )
+        client._ensure_open = AsyncMock()
+
+        result = await client.symbols("Quest", path="/tmp/Quest.cs")
+
+        self.assertEqual(result, hit)
+        self.assertTrue(client.workspace_ready)
+        self.assertEqual(len(self.requests(client)), 2)
+        self.assertIn(
+            {"jsonrpc": "2.0", "id": "config", "result": [None]},
+            decode_frames(bytes(client.proc.stdin.data)),
+        )
+        client._ensure_open.assert_awaited_once_with("/tmp/Quest.cs")
+
+    async def test_ready_empty_is_returned_without_retry(self):
+        client, _ = self.make_client(self.ready(), self.reply(1, []))
+
+        self.assertEqual(await client.symbols("missing"), [])
+        self.assertTrue(client.workspace_ready)
+        self.assertEqual(len(self.requests(client)), 1)
+
+    async def test_non_roslyn_empty_is_not_retried(self):
+        client, _ = self.make_client(self.reply(1, []), server="csharp-ls")
+
+        self.assertEqual(await client.symbols("missing"), [])
+        self.assertEqual(len(self.requests(client)), 1)
+
+    async def test_cold_hit_is_returned_without_waiting(self):
+        hit = [{"name": "Quest"}]
+        client, _ = self.make_client(self.reply(1, hit))
+
+        self.assertEqual(await client.symbols("Quest"), hit)
+        self.assertFalse(client.workspace_ready)
+        self.assertEqual(len(self.requests(client)), 1)
+
+    async def test_retry_can_return_a_genuine_empty_result(self):
+        client, _ = self.make_client(self.reply(1, []), self.ready(), self.reply(2, []))
+
+        self.assertEqual(await client.symbols("missing"), [])
+        self.assertEqual(len(self.requests(client)), 2)
+
+    async def test_loading_timeout_is_bounded_and_client_can_be_used_later(self):
+        client, reader = self.make_client(self.reply(1, []))
+
+        with self.assertRaisesRegex(asyncio.TimeoutError, "项目加载尚未完成"):
+            await client.symbols("Quest", timeout=0.02)
+
+        self.assertEqual(len(self.requests(client)), 1)
+        self.assertFalse(client._lock.locked())
+        hit = [{"name": "Quest"}]
+        reader.feed_data(lsp.LSPClient._frame(self.ready()))
+        reader.feed_data(lsp.LSPClient._frame(self.reply(2, hit)))
+        self.assertEqual(await client.symbols("Quest"), hit)
+        self.assertEqual(len(self.requests(client)), 2)
+
+    async def test_eof_during_project_loading_is_reported_without_retry(self):
+        client, _ = self.make_client(self.reply(1, []), eof=True)
+        client._stderr.extend(b"project host closed")
+
+        with self.assertRaisesRegex(RuntimeError, "project host closed"):
+            await client.symbols("Quest")
+
+        self.assertEqual(len(self.requests(client)), 1)
+
+    async def test_server_error_is_not_retried(self):
+        client, _ = self.make_client(
+            {"jsonrpc": "2.0", "id": 1, "error": {"message": "broken"}}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "broken"):
+            await client.symbols("Quest")
+
+        self.assertEqual(len(self.requests(client)), 1)
+
+    async def test_retry_uses_the_remaining_original_budget(self):
+        client, _ = self.make_client()
+        client._request = AsyncMock(side_effect=[[], [{"name": "Quest"}]])
+        client._wait_workspace_ready = AsyncMock()
+        clock = types.SimpleNamespace(monotonic=Mock(side_effect=[100, 100, 130]))
+
+        with patch.object(lsp, "time", clock):
+            await client.symbols("Quest", timeout=90)
+
+        self.assertEqual(client._request.await_args_list[0].kwargs["timeout"], 90)
+        self.assertEqual(client._request.await_args_list[1].kwargs["timeout"], 60)
+        client._wait_workspace_ready.assert_awaited_once_with(190)
+
+    async def test_start_cancellation_closes_the_new_process(self):
+        client, _ = self.make_client()
+        proc = client.proc
+        proc.wait = AsyncMock(return_value=0)
+        client._request = AsyncMock(side_effect=[asyncio.CancelledError(), None])
+        with (
+            patch.object(lsp, "_has_csharp_project", return_value=True),
+            patch.object(lsp, "_spawn_lsp_process", new=AsyncMock(return_value=proc)),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await client.start()
+
+        self.assertIsNone(client.proc)
+        self.assertTrue(proc.stdin.closed)
+        self.assertTrue(proc._transport.closed)
 
 
 if __name__ == "__main__":

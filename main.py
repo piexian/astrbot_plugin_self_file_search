@@ -42,6 +42,7 @@ MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_LINE_CHARS = 300
 SEARCH_TIMEOUT_SECONDS = 20
 SEARCH_OUTPUT_CAP = 16000
+SYMBOL_QUERY_TIMEOUT_SECONDS = 90
 
 
 def _astrbot_whitelist_sources() -> dict[str, dict]:
@@ -217,7 +218,7 @@ def _line_text(abs_path: str, line1: int) -> str:
 
 
 def _locate(line_text: str, symbol: str | None) -> tuple[str, int] | None:
-    """返回 (符号, 行内 Python 字符偏移)；symbol 缺省取行内第一个标识符。"""
+    """定位指定符号或行内首个至少 3 字符的词，返回名称和字符偏移。"""
     if not symbol:
         match = re.search(r"\w{3,}", line_text)
         if not match:
@@ -370,13 +371,12 @@ def _compile(pattern: str, case_sensitive: bool, is_regex: bool):
 class SelfSearchTool(FunctionTool[AstrAgentContext]):
     name: str = "self_search"
     description: str = (
-        "Search text/code inside a whitelisted data source directory (interface "
-        "borrowed from fastctx). Three output modes: mode=content returns `file:line: "
-        "content` hit lines (default, supports context_lines); mode=files returns "
-        "matching file paths only (locate files first); mode=count returns per-file "
-        "hit counts. Case-insensitive substring by default; supports regex, file_glob "
-        "and offset paging. Ideal for locating code by class name, function name, "
-        "identifier or error message."
+        "Search file contents using short identifiers or literal text; regex needs "
+        "is_regex=true. Confirm uncertain paths with self_glob. Narrow file_glob "
+        "to the relevant project/version; if empty, check the filter and try a "
+        "simpler pattern or wider scope. mode=content returns numbered hit lines "
+        "(default); files returns paths containing the pattern; count returns "
+        "per-file hit counts. Supports context_lines and offset paging."
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -384,11 +384,14 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Data source name",
+                    "description": "Exact configured data source name",
                 },
                 "pattern": {
                     "type": "string",
-                    "description": "Text or regex to search for",
+                    "description": (
+                        "Literal substring by default. For regex such as foo|bar "
+                        "or foo.*bar, set is_regex=true. Use identifiers, not questions."
+                    ),
                 },
                 "mode": {
                     "type": "string",
@@ -400,7 +403,12 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 },
                 "file_glob": {
                     "type": "string",
-                    "description": "Optional filename or relative-path globs, comma-separated; default all files",
+                    "description": (
+                        "Comma-separated globs; default all files. *.cs matches "
+                        "basenames at any depth; src/*.cs matches source-relative "
+                        "paths. Confirm uncertain paths with self_glob and select "
+                        "the relevant project/version when duplicates exist."
+                    ),
                 },
                 "exclude_glob": {
                     "type": "string",
@@ -411,7 +419,11 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 },
                 "is_regex": {
                     "type": "boolean",
-                    "description": "Whether pattern is parsed as regex; default false (plain text)",
+                    "description": (
+                        "Default false: pattern characters are literal. Set true "
+                        "for regex operators such as |, .*, or character classes; "
+                        "file_glob uses separate glob syntax."
+                    ),
                 },
                 "case_sensitive": {
                     "type": "boolean",
@@ -668,14 +680,12 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
 class SelfReadTool(FunctionTool[AstrAgentContext]):
     name: str = "self_read"
     description: str = (
-        "Read text/code files inside a whitelisted data source (relative path, "
-        "line-numbered, length-capped). Use start_line/end_line to read a specific "
-        "line range (end_line negative counts from the end, e.g. -1 = last line) "
-        "instead of always reading from the top. Paths come from self_search / "
-        "self_symbols hits; follow the start_line hint to continue long files. Pass "
-        "`files` (up to 8) to batch-read several files in one call with a shared "
-        "output budget; per-file problems are reported inline. Omit files to read "
-        "a single path."
+        "Read existing source-relative files with numbered lines and an output "
+        "budget. Get paths and line numbers from self_glob/search/symbols. Set "
+        "start_line/end_line to the needed snippet; bounds are inclusive and a "
+        "negative end_line counts from the end (-1 = last line). Completed explicit "
+        "ranges return only the path and content; only truncation adds a range "
+        "continuation hint. Use files to batch up to 8 files with a shared budget."
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -683,11 +693,11 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "Data source name",
+                    "description": "Exact configured data source name",
                 },
                 "path": {
                     "type": "string",
-                    "description": "Relative path inside the data source (single-file form)",
+                    "description": "Existing source-relative file path from self_glob or search; not a glob (single-file form)",
                 },
                 "files": {
                     "type": "array",
@@ -697,7 +707,7 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Relative path inside the data source",
+                                "description": "Existing source-relative file path from self_glob or search; not a glob",
                             },
                             "start_line": {
                                 "type": "integer",
@@ -706,8 +716,9 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
                             "end_line": {
                                 "type": "integer",
                                 "description": (
-                                    "Optional 1-based inclusive end line; "
-                                    "negative counts from the end (-1 = last line)"
+                                    "Inclusive end of the needed snippet; negative "
+                                    "counts from the end (-1 = last line). Completed "
+                                    "ranges have no continuation hint."
                                 ),
                             },
                             "max_chars": {
@@ -724,7 +735,11 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
                 },
                 "end_line": {
                     "type": "integer",
-                    "description": "Optional 1-based inclusive end line; negative counts from the end (-1 = last line)",
+                    "description": (
+                        "Inclusive end of the needed snippet; negative counts from "
+                        "the end (-1 = last line). Set this to avoid reading the "
+                        "rest of the file; only truncation adds a continuation hint."
+                    ),
                 },
                 "max_chars": {
                     "type": "integer",
@@ -772,19 +787,18 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
             text = f"[{src}] 批量读取 {len(files)} 个文件\n" + "\n".join(blocks)
             if truncated:
                 text += (
-                    "\n（Partial：有文件未显示完整，按各文件头提示的 start_line 续读）"
+                    "\n（Partial：有文件未显示完整，按各文件提示的 start_line 续读）"
                 )
             return _limit(
                 text,
                 SEARCH_OUTPUT_CAP,
-                "输出超限：改小各文件的 max_chars，或拆成两次调用分批读"
-                "（各文件头已注明还剩多少行未读）。",
+                "输出超限：调小各文件的 max_chars，或拆分 files 后分批读取。",
             )
 
         rel = str(kwargs.get("path", "")).strip()
         if not rel:
             return _err("请提供 path 或 files。")
-        head, body, more = self._read_entry(
+        head, body, _ = self._read_entry(
             root,
             {
                 "path": rel,
@@ -798,47 +812,16 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
             ),
         )
         text = f"{head}\n{body}" if body else head
-        if more:
-            # 续读提示放正文末尾：模型读到结尾才需要知道下一步
-            mm = re.search(r"显示 (\d+)-(\d+) 行", head)
-            tip = (
-                (
-                    "\n（Partial：未显示完整，用 start_line="
-                    + str(int(mm.group(2)) + 1)
-                    + " 继续读）"
-                )
-                if mm
-                else "\n（Partial：未显示完整，用 start_line 指定起点继续读）"
-            )
-            text += tip
-        m = re.search(r"显示 (\d+)-(\d+) 行", head)
-        mtotal = re.search(r"共 (\d+) 行", head)
-        total_hint = int(mtotal.group(1)) if mtotal else 0
-        page_size = (int(m.group(2)) - int(m.group(1)) + 1) if m else 0
-        if m:
-            nxt = int(m.group(2)) + 1
-            last = int(m.group(2))
-            nxt = last + 1
-            next_hint = (
-                "输出超限：改用 start_line=" + str(nxt) + " 继续读"
-                "（读到底 start_line="
-                + str(nxt)
-                + "&end_line="
-                + str(total_hint)
-                + "；只读一页 start_line="
-                + str(nxt)
-                + "&end_line="
-                + str(min(total_hint, last + page_size))
-                + "）。"
-            )
-        else:
-            next_hint = "输出超限：用 start_line 指定起点继续读。"
+        next_hint = (
+            "输出超限：调小 max_chars，从正文末行行号重新读取；"
+            "若指定了 end_line，保持原终点。"
+        )
         return _limit(f"{_stamp(root)}[{src}] " + text, SEARCH_OUTPUT_CAP, next_hint)
 
     def _read_entry(
         self, root: str, entry: dict, default_chars: int
     ) -> tuple[str, str, bool]:
-        """读单个条目，返回 (头信息, 正文, 是否还有剩余)。"""
+        """读单个条目，返回头信息、正文和请求区间是否被截断。"""
         rel = str(entry.get("path", "")).strip()
         abs_path = _contain(root, rel)
         if abs_path is None:
@@ -858,7 +841,8 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
         s = min(start, max(total, 1))
         # end_line: 闭区间；负数从末尾倒数（-1 = 最后一行）
         raw_end = entry.get("end_line")
-        if raw_end not in (None, ""):
+        bounded = raw_end not in (None, "")
+        if bounded:
             try:
                 n = int(raw_end)
             except (TypeError, ValueError):
@@ -876,41 +860,51 @@ class SelfReadTool(FunctionTool[AstrAgentContext]):
             out.append(piece)
             used += len(piece)
         end = s + len(out) - 1
-        head = f"{rel}（共 {total} 行，显示 {s}-{end} 行）"
-        if end < total:
-            left_lines = total - end
-            left_chars = sum(len(x) for x in lines[end:])
-            pages = max(1, -(-left_chars // max(max_chars, 1)))
-            nxt = end + 1
-            # 精确给出下一页的区间终点，别让模型自己猜
-            page_end = min(total, nxt + max(1, len(out)) - 1)
-            head += (
-                f"，还剩 {left_lines} 行未读（约 {left_chars} 字符，按当前 max_chars"
-                f" 估计还需 {pages} 次）；续读：start_line={nxt}（读到文件末尾则用"
-                f" start_line={nxt}&end_line={total}，只读下一页用"
-                f" start_line={nxt}&end_line={page_end}）"
-            )
-            return head, "".join(out), True
-        return head, "".join(out), False
+        body = "".join(out)
+        head = rel if bounded else f"{rel}（共 {total} 行，显示 {s}-{end} 行）"
+        if end >= stop:
+            return head, body, False
+        nxt = end + 1
+        if bounded:
+            body += f"\n（请求区间未显示完整，续读：start_line={nxt}&end_line={stop}）"
+            return head, body, True
+        left_lines = stop - end
+        left_chars = sum(len(x) for x in lines[end:stop])
+        pages = max(1, -(-left_chars // max(max_chars, 1)))
+        page_end = min(stop, nxt + max(1, len(out)) - 1)
+        head += (
+            f"，还剩 {left_lines} 行未读（约 {left_chars} 字符，按当前 max_chars"
+            f" 估计还需 {pages} 次）；续读：start_line={nxt}（读到文件末尾则用"
+            f" start_line={nxt}&end_line={stop}，只读下一页用"
+            f" start_line={nxt}&end_line={page_end}）"
+        )
+        return head, body, True
 
 
 @dataclass
 class SelfGlobTool(FunctionTool[AstrAgentContext]):
     name: str = "self_glob"
     description: str = (
-        "List files inside a whitelisted data source by filename or relative-path "
-        "globs (e.g. *.cs, versions/lang/Thing.json); comma-separated patterns are "
-        "supported. Use it to confirm a path or browse structure; use self_search "
-        "to find code by content."
+        "Find file paths by filename or source-relative path globs, not by "
+        "content or regex. Comma-separated patterns are supported. Confirm "
+        "uncertain filenames here before passing paths to self_read or LSP tools; "
+        "use self_search to search file contents."
     )
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "source": {"type": "string", "description": "Data source name"},
+                "source": {
+                    "type": "string",
+                    "description": "Exact configured data source name",
+                },
                 "pattern": {
                     "type": "string",
-                    "description": "Filename or relative-path globs, comma-separated; default * (all files)",
+                    "description": (
+                        "Filename or source-relative globs, comma-separated; "
+                        "default *. *.cs matches basenames at any depth; "
+                        "src/*.cs matches source-relative paths, not file contents."
+                    ),
                 },
                 "max": {
                     "type": "integer",
@@ -978,25 +972,36 @@ class SelfGlobTool(FunctionTool[AstrAgentContext]):
 class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
     name: str = "self_symbols"
     description: str = (
-        "Search workspace symbols (classes/methods/fields/enums) via the language "
-        "server — semantically more precise than plain-text search. Requires an LSP "
-        "server for the language on PATH; on first call the server may still be "
-        "indexing, so retry if the result is empty. Optional path selects the nearest "
-        "project root and opens that file before the workspace query. csharp-ls requires "
-        "a .sln/.csproj/.fsproj file under the source."
+        "Search symbols in a language-server workspace. Requires a server on "
+        "PATH and a project file for C#. Pass a known source-relative path to "
+        "select its nearest project and open the file. Roslyn cold empty results "
+        "automatically wait for project readiness and retry once; initialization, "
+        "waiting and queries share a 90-second total budget. For an empty result "
+        "in a loaded project, check the name and scope with self_search."
     )
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "source": {"type": "string", "description": "Data source name"},
+                "source": {
+                    "type": "string",
+                    "description": "Exact configured data source name",
+                },
                 "query": {
                     "type": "string",
-                    "description": "Symbol name or a part of it, e.g. ThrowMethod",
+                    "description": (
+                        "Symbol name or fragment, not a question. If no matches, check "
+                        "spelling and project scope with self_search."
+                    ),
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional file inside the source used to select its project and establish LSP context",
+                    "description": (
+                        "Existing source-relative file, not a glob. Selects its "
+                        "nearest project and opens it, possibly starting a cold "
+                        "client. Roslyn readiness and one retry are handled "
+                        "automatically within the shared 90-second budget."
+                    ),
                 },
                 "ext": {
                     "type": "string",
@@ -1033,19 +1038,46 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
             if not self.plugin_ref._lsp_ext_cache.get(root):
                 self.plugin_ref._lsp_ext_cache[root] = guess_ext(root)
             ext_hint = self.plugin_ref._lsp_ext_cache.get(root)
-        client = await _lsp_client(
-            self.plugin_ref, kwargs, root, ext_hint, path=abs_path
-        )
-        if isinstance(client, str):
-            return client
         query = str(kwargs.get("query", "")).strip()
         if not query:
             return _err("query 为空。")
         limit = max(1, min(int(kwargs.get("max", 30) or 30), 100))
+        client = None
+        deadline = time.monotonic() + SYMBOL_QUERY_TIMEOUT_SECONDS
+
+        async def query_symbols():
+            nonlocal client
+            selected = await _lsp_client(
+                self.plugin_ref, kwargs, root, ext_hint, path=abs_path
+            )
+            if isinstance(selected, str):
+                return selected
+            client = selected
+            return await client.symbols(
+                query,
+                timeout=max(0, deadline - time.monotonic()),
+                path=abs_path,
+            )
+
         try:
-            result = await client.symbols(query, path=abs_path)
+            result = await asyncio.wait_for(
+                query_symbols(), timeout=SYMBOL_QUERY_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            if client is None:
+                message = "语言服务器初始化尚未完成"
+            elif not client.workspace_ready:
+                message = "Roslyn 项目加载尚未完成"
+            else:
+                message = "符号查询超时"
+            return _err(
+                f"{message}（{SYMBOL_QUERY_TIMEOUT_SECONDS} 秒总预算）；"
+                "可稍后重试或用 self_search 文本核对。"
+            )
         except Exception as exc:  # noqa: BLE001 - LSP 异常需转成用户可读错误
             return _err(f"符号搜索失败：{exc}")
+        if isinstance(result, str):
+            return result
         items = result if isinstance(result, list) else []
         lines: list[str] = []
         for item in items[:limit]:
@@ -1059,7 +1091,7 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
             lines.append(f"{rel}:{line1}: [{kind}] {item.get('name', '')}")
         head = f"符号 {query!r} 命中 {len(lines)} 条"
         if not lines:
-            head += "（服务器可能仍在建立索引，稍后重试通常会有结果；也可先用 self_search 文本兜底）"
+            head += "（可用 self_search 核对名称和项目范围）"
         return head + "\n" + "\n".join(lines)
 
 
@@ -1067,18 +1099,26 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
 class SelfRefsTool(FunctionTool[AstrAgentContext]):
     name: str = "self_refs"
     description: str = (
-        "Find all references to a symbol across the data source (semantic, resolved "
-        "by the language server, cross-file). path/line come from self_search or "
-        "self_symbols hits; symbol defaults to the first identifier on that line."
+        "Find semantic references in the selected file's loaded project(s), "
+        "including the declaration. Use source-relative path and 1-based line "
+        "from search/read results. Pass symbol explicitly when the line contains "
+        "keywords or multiple names. A declaration-only result can be correct."
     )
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "source": {"type": "string", "description": "Data source name"},
+                "source": {
+                    "type": "string",
+                    "description": "Exact configured data source name",
+                },
                 "path": {
                     "type": "string",
-                    "description": "Relative path inside the data source",
+                    "description": (
+                        "Existing source-relative file from self_glob/search; "
+                        "selects its nearest project. References cover loaded "
+                        "projects only and include the declaration."
+                    ),
                 },
                 "line": {
                     "type": "integer",
@@ -1086,7 +1126,11 @@ class SelfRefsTool(FunctionTool[AstrAgentContext]):
                 },
                 "symbol": {
                     "type": "string",
-                    "description": "Optional symbol to query; defaults to the first identifier on that line",
+                    "description": (
+                        "Exact identifier on this line; recommended when keywords "
+                        "or multiple names occur. If omitted, the first word of "
+                        "at least 3 characters is used."
+                    ),
                 },
                 "ext": {
                     "type": "string",
@@ -1164,18 +1208,24 @@ class SelfRefsTool(FunctionTool[AstrAgentContext]):
 class SelfDefTool(FunctionTool[AstrAgentContext]):
     name: str = "self_def"
     description: str = (
-        "Jump to a symbol's definition (semantic, resolved by the language server, "
-        "cross-file). path/line point at a usage; symbol defaults to the first "
-        "identifier on that line."
+        "Jump to a symbol definition in the selected file's loaded workspace. "
+        "Use source-relative path and 1-based line from search/read results. "
+        "Pass symbol explicitly when the line contains keywords or multiple names."
     )
     parameters: dict = Field(
         default_factory=lambda: {
             "type": "object",
             "properties": {
-                "source": {"type": "string", "description": "Data source name"},
+                "source": {
+                    "type": "string",
+                    "description": "Exact configured data source name",
+                },
                 "path": {
                     "type": "string",
-                    "description": "Relative path inside the data source",
+                    "description": (
+                        "Existing source-relative file from self_glob/search; "
+                        "selects its nearest project and searches the loaded workspace."
+                    ),
                 },
                 "line": {
                     "type": "integer",
@@ -1183,7 +1233,11 @@ class SelfDefTool(FunctionTool[AstrAgentContext]):
                 },
                 "symbol": {
                     "type": "string",
-                    "description": "Optional symbol to jump to; defaults to the first identifier on that line",
+                    "description": (
+                        "Exact identifier on this line; recommended when keywords "
+                        "or multiple names occur. If omitted, the first word of "
+                        "at least 3 characters is used."
+                    ),
                 },
                 "ext": {
                     "type": "string",

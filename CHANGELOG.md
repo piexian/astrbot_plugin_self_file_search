@@ -4,6 +4,12 @@
 
 
 
+## [Unreleased]
+
+- Roslyn `self_symbols` 对未就绪的首次空结果等待 `workspace/projectInitializationComplete`，在 90 秒总预算内仅重查一次，超时直接报告。
+- 工具说明和参数 schema 明确文本默认按字面量、正则需 `is_regex=true`，并补充 `file_glob` 路径/多模式与符号范围规则。
+- `self_read` 显式行区间只返回文件路径和带行号正文；只有请求区间自身被预算截断时才提示区间内续读，默认读取行为保留。
+
 ## [1.1.0] - 2026-11-09
 
 - 按服务器和文件发现项目根目录，`self_symbols` 支持可选 `path` 建立文件上下文。

@@ -344,7 +344,7 @@ def _has_csharp_project(root: str) -> bool:
 
 
 class LSPClient:
-    """单个语言服务器进程。请求串行化（锁），响应按 id 匹配，通知丢弃。"""
+    """单个语言服务器进程，串行请求并处理服务器请求和项目就绪通知。"""
 
     def __init__(
         self,
@@ -357,6 +357,7 @@ class LSPClient:
         self.root, self.ext, self.argv = root, ext, argv
         self.server = server or server_id(argv, ext)
         self.initialization = initialization or {}
+        self.workspace_ready = self.server != "roslyn-language-server"
         self.proc: asyncio.subprocess.Process | None = None
         self._lock = asyncio.Lock()
         self._next_id = 0
@@ -408,7 +409,7 @@ class LSPClient:
                     "workspace/didChangeConfiguration",
                     {"settings": self.initialization},
                 )
-        except Exception:
+        except (Exception, asyncio.CancelledError):
             await self.stop()
             raise
         logger.debug(
@@ -520,6 +521,40 @@ class LSPClient:
         self._send_raw(method, params, is_notify=True)
         await self.proc.stdin.drain()
 
+    async def _read_message(self, method: str, timeout: float) -> dict:
+        if not self.proc or not self.proc.stdout:
+            raise RuntimeError("服务器进程未运行")
+        deadline = time.monotonic() + timeout
+        try:
+            header = await asyncio.wait_for(
+                self.proc.stdout.readuntil(b"\r\n\r\n"), timeout=timeout
+            )
+            match = re.search(rb"Content-Length: (\d+)", header)
+            if not match:
+                raise RuntimeError(f"LSP {method} 响应缺少 Content-Length")
+            body = await asyncio.wait_for(
+                self.proc.stdout.readexactly(int(match.group(1))),
+                timeout=max(0, deadline - time.monotonic()),
+            )
+        except asyncio.IncompleteReadError as exc:
+            raise self._process_error(method) from exc
+        return json.loads(body.decode("utf-8", errors="replace"))
+
+    async def _handle_server_message(self, message: dict) -> None:
+        if "id" in message:
+            await self._handle_server_request(message)
+        elif message.get("method") == "workspace/projectInitializationComplete":
+            self.workspace_ready = True
+
+    async def _wait_workspace_ready(self, deadline: float) -> None:
+        async with self._lock:
+            while not self.workspace_ready:
+                message = await self._read_message(
+                    "等待项目就绪", max(0, deadline - time.monotonic())
+                )
+                if "method" in message:
+                    await self._handle_server_message(message)
+
     async def _request(self, method: str, params, timeout: float = 60):
         async with self._lock:
             if not self.proc or not self.proc.stdout:
@@ -539,23 +574,9 @@ class LSPClient:
                         f"LSP {method} timed out after {timeout}s (root={self.root})"
                     )
                     raise TimeoutError(f"{method} 响应超时（{timeout}s）")
-                try:
-                    header = await asyncio.wait_for(
-                        self.proc.stdout.readuntil(b"\r\n\r\n"), timeout=remaining
-                    )
-                    match = re.search(rb"Content-Length: (\d+)", header)
-                    if not match:
-                        raise RuntimeError(f"LSP {method} 响应缺少 Content-Length")
-                    body = await asyncio.wait_for(
-                        self.proc.stdout.readexactly(int(match.group(1))),
-                        timeout=remaining,
-                    )
-                except asyncio.IncompleteReadError as exc:
-                    raise self._process_error(method) from exc
-                message = json.loads(body.decode("utf-8", errors="replace"))
+                message = await self._read_message(method, remaining)
                 if "method" in message:
-                    if "id" in message:
-                        await self._handle_server_request(message)
+                    await self._handle_server_message(message)
                     continue
                 if message.get("id") != msg_id:
                     continue
@@ -599,10 +620,30 @@ class LSPClient:
         self._opened.add(uri)
 
     async def symbols(self, query: str, timeout: float = 90, path: str | None = None):
+        try:
+            return await asyncio.wait_for(
+                self._symbols(query, timeout, path), timeout=timeout
+            )
+        except asyncio.TimeoutError as exc:
+            if not self.workspace_ready:
+                raise asyncio.TimeoutError(
+                    "Roslyn 项目加载尚未完成，符号查询等待超时。"
+                ) from exc
+            raise asyncio.TimeoutError("workspace/symbol 查询超时。") from exc
+
+    async def _symbols(self, query: str, timeout: float, path: str | None):
+        deadline = time.monotonic() + timeout
         if path:
             await self._ensure_open(path)
+        params = {"query": query}
+        result = await self._request(
+            "workspace/symbol", params, timeout=max(0, deadline - time.monotonic())
+        )
+        if result or self.workspace_ready:
+            return result
+        await self._wait_workspace_ready(deadline)
         return await self._request(
-            "workspace/symbol", {"query": query}, timeout=timeout
+            "workspace/symbol", params, timeout=max(0, deadline - time.monotonic())
         )
 
     async def definition(self, path: str, line0: int, char: int):
