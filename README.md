@@ -38,18 +38,32 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 | 工具 | 功能 |
 |------|------|
 | `self_search` | 目录内 grep：`mode=content`（命中行，默认）/ `files`（命中文件）/ `count`（每文件计数）；支持正则、大小写、前后文、分页、排除模式；`file_glob` 支持文件名、相对路径和逗号分隔的多个模式；空结果区分无候选文件、无内容命中与扫描不完整 |
-| `self_read` | 读文件（带行号）；`start_line`/`end_line` 指定行区间（`end_line` 负数从末尾倒数，`-1` = 最后一行）；头部给出「还剩多少行/约多少字符/估计还需几次」，末尾给出精确续读参数；`files` 数组一次最多批量读 8 个，共享输出预算，逐文件报错 |
+| `self_read` | 读取带行号的文件内容；显式指定 `start_line`/`end_line` 时只返回文件路径和带行号正文；只有请求区间自身被预算截断时才提示区间内续读；`end_line` 为负数时从末尾倒数；`files` 最多批量读取 8 项；未指定 `end_line` 时保留默认读取行为 |
 | `self_glob` | 按文件名或相对路径通配符列文件，支持逗号分隔的多个模式 |
 
 ### LSP 语义级（需要环境里有对应语言服务器）
 
-C# 默认优先 `roslyn-language-server --stdio --autoLoadProjects`，未安装时回退 `csharp-ls`。两者都需要数据源内至少一个 `.sln`、`.csproj` 或 `.fsproj` 文件。插件不自动安装服务器；各服务器可能按自身机制生成索引或缓存。
+C# 默认优先 `roslyn-language-server --stdio --autoLoadProjects`，未安装时回退 `csharp-ls`。两者都需要数据源内至少一个 `.sln`、`.csproj` 或 `.fsproj` 文件。插件不自动安装服务器；服务器可能按自身机制生成索引或缓存。
+
+Roslyn `self_symbols` 对发起时未就绪的首次空结果等待就绪后重查一次，初始化与查询共用 90 秒预算；超时后保留初始化供后续调用复用，活动查询不参与空闲回收。
 
 | 工具 | 功能 |
 |------|------|
 | `self_symbols` | 工作区符号搜索（类/方法/字段）；可选 `path` 用于选择最近项目并先打开文件建立上下文 |
-| `self_refs` | 符号的全部引用（跨文件语义解析），`path/line` 定位，`symbol` 缺省取该行第一个标识符 |
-| `self_def` | 跳到符号定义处（可跨文件） |
+| `self_refs` | 符号的全部引用（跨文件语义解析，包含声明；仅覆盖已加载项目），按 `path`/`line` 定位；建议显式传 `symbol` |
+| `self_def` | 跳到符号定义处（可跨文件）；建议显式传 `symbol` |
+
+## 参数约定
+
+工具说明和参数 schema 会直接提供以下用法约束，不依赖额外人格提示：
+
+- 文本条件默认按字面量匹配；需要正则时显式设置 `is_regex=true`，例如 `foo|bar` 或 `foo.*bar`。
+- `file_glob` 不含目录时匹配文件名，含目录时匹配数据源相对路径，逗号分隔多个模式；不知道路径时先用 `self_glob`，空结果先检查过滤范围。
+
+通用示例：
+
+- `self_search(pattern="foo|bar", is_regex=true, source="project", file_glob="src/*.py,tests/*.py")`
+- `self_read(source="project", path="src/service.py", start_line=20, end_line=40)`
 
 ## 使用
 

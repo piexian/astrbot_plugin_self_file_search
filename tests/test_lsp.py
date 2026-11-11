@@ -360,9 +360,123 @@ class ServerAdapterTests(unittest.IsolatedAsyncioTestCase):
         await client.symbols("Quest", path="/tmp/Quest.cs")
 
         client._ensure_open.assert_awaited_once_with("/tmp/Quest.cs")
-        client._request.assert_awaited_once_with(
-            "workspace/symbol", {"query": "Quest"}, timeout=90
-        )
+        client._request.assert_awaited_once()
+        call = client._request.await_args
+        self.assertEqual(call.args, ("workspace/symbol", {"query": "Quest"}))
+        self.assertGreater(call.kwargs["timeout"], 0)
+        self.assertLessEqual(call.kwargs["timeout"], 90)
+
+    async def test_cancelled_get_reuses_shared_initialization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = lsp.LSPManager()
+            start_entered = asyncio.Event()
+            release = asyncio.get_running_loop().create_future()
+            clients = []
+            start_calls = []
+            probe_calls = []
+            second_probe = asyncio.Event()
+
+            def probe(_ext, _overrides):
+                probe_calls.append(None)
+                if len(probe_calls) == 2:
+                    second_probe.set()
+                return ["csharp-ls"], []
+
+            async def start(client):
+                start_calls.append(client)
+                client.proc = FakeProcess()
+                client.stop = AsyncMock()
+                clients.append(client)
+                start_entered.set()
+                await release
+
+            with (
+                patch.object(lsp, "probe", new=probe),
+                patch.object(lsp.LSPClient, "start", new=start),
+            ):
+                first = asyncio.create_task(manager.get(tmp, "cs", {}))
+                await start_entered.wait()
+
+                first.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+
+                clients[0].stop.assert_not_awaited()
+                second = asyncio.create_task(manager.get(tmp, "cs", {}))
+                await second_probe.wait()
+                self.assertFalse(second.done())
+                self.assertEqual(len(start_calls), 1)
+
+                release.set_result(None)
+                result = await second
+
+            self.assertIs(result, clients[0])
+            self.assertEqual(len(start_calls), 1)
+            clients[0].stop.assert_not_awaited()
+            await manager.shutdown()
+            clients[0].stop.assert_awaited_once()
+
+    async def test_reaper_skips_active_symbols_and_reaps_after_completion(self):
+        manager = lsp.LSPManager(idle_minutes=1)
+        client = lsp.LSPClient("/tmp", "cs", ["roslyn-language-server"])
+        client.proc = FakeProcess()
+        client.workspace_ready = False
+        key = ("/tmp", "roslyn-language-server")
+        manager._clients[key] = client
+
+        ready_waiting = asyncio.Event()
+        release = asyncio.get_running_loop().create_future()
+
+        async def wait_workspace_ready(_deadline):
+            ready_waiting.set()
+            await release
+            client.workspace_ready = True
+
+        client._wait_workspace_ready = wait_workspace_ready
+        client._request = AsyncMock(return_value=[])
+        stop_called = asyncio.Event()
+
+        async def stop_client():
+            stop_called.set()
+
+        client.stop = AsyncMock(side_effect=stop_client)
+        operation = asyncio.create_task(client.symbols("Quest"))
+        await ready_waiting.wait()
+        self.assertEqual(client._active_operations, 1)
+        client.last_used = lsp.time.monotonic() - 61
+
+        first_pass_done = asyncio.Event()
+        stop_gate = asyncio.Event()
+        sleep_calls = 0
+
+        async def controlled_sleep(_seconds):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls == 1:
+                return
+            first_pass_done.set()
+            await stop_gate.wait()
+            stop_gate.clear()
+
+        with patch.object(lsp.asyncio, "sleep", new=controlled_sleep):
+            reaper = asyncio.create_task(manager._reap_loop())
+            await first_pass_done.wait()
+            self.assertIn(key, manager._clients)
+            client.stop.assert_not_awaited()
+
+            release.set_result(None)
+            await operation
+            self.assertEqual(client._active_operations, 0)
+            client.last_used = lsp.time.monotonic() - 61
+            stop_gate.set()
+            await stop_called.wait()
+            self.assertNotIn(key, manager._clients)
+
+            reaper.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await reaper
+
+        await manager.shutdown()
 
     async def test_start_failure_is_not_retried_until_shutdown(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -413,6 +527,237 @@ class ServerAdapterTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(proc.communicate(), timeout=5)
 
             self.assertEqual(proc.returncode, 0)
+
+
+class RoslynReadinessTests(unittest.IsolatedAsyncioTestCase):
+    def make_client(self, *messages, server="roslyn-language-server", eof=False):
+        reader = asyncio.StreamReader()
+        for message in messages:
+            reader.feed_data(lsp.LSPClient._frame(message))
+        if eof:
+            reader.feed_eof()
+        client = lsp.LSPClient("/tmp", "cs", [server])
+        client.proc = FakeProcess(stdout=reader)
+        return client, reader
+
+    def reply(self, number, result):
+        return {"jsonrpc": "2.0", "id": number, "result": result}
+
+    def ready(self):
+        return {"jsonrpc": "2.0", "method": "workspace/projectInitializationComplete"}
+
+    def requests(self, client):
+        return [
+            message
+            for message in decode_frames(bytes(client.proc.stdin.data))
+            if message.get("method") == "workspace/symbol"
+        ]
+
+    async def test_cold_empty_waits_for_ready_and_retries_once(self):
+        hit = [{"name": "Quest"}]
+        client, _ = self.make_client(
+            self.reply(1, []),
+            {
+                "jsonrpc": "2.0",
+                "id": "config",
+                "method": "workspace/configuration",
+                "params": {"items": [{"section": "project"}]},
+            },
+            self.ready(),
+            self.reply(2, hit),
+        )
+        client._ensure_open = AsyncMock()
+
+        retry_ready = []
+        original_send_raw = client._send_raw
+
+        def record_send(method, params, is_notify, msg_id=None):
+            if method == "workspace/symbol":
+                retry_ready.append(client.workspace_ready)
+            return original_send_raw(method, params, is_notify, msg_id)
+
+        client._send_raw = Mock(side_effect=record_send)
+
+        result = await client.symbols("Quest", path="/tmp/Quest.cs")
+        self.assertEqual(retry_ready, [False, True])
+
+        self.assertEqual(result, hit)
+        self.assertTrue(client.workspace_ready)
+        self.assertEqual(len(self.requests(client)), 2)
+        self.assertIn(
+            {"jsonrpc": "2.0", "id": "config", "result": [None]},
+            decode_frames(bytes(client.proc.stdin.data)),
+        )
+        client._ensure_open.assert_awaited_once_with("/tmp/Quest.cs")
+
+    async def test_ready_notification_before_empty_response_still_retries(self):
+        hit = [{"name": "Quest"}]
+        client, _ = self.make_client(
+            self.ready(), self.reply(1, []), self.reply(2, hit)
+        )
+
+        self.assertEqual(await client.symbols("Quest"), hit)
+        self.assertTrue(client.workspace_ready)
+        self.assertEqual(len(self.requests(client)), 2)
+
+    async def test_ready_empty_is_returned_without_retry(self):
+        client, _ = self.make_client(self.reply(1, []))
+        client.workspace_ready = True
+
+        self.assertEqual(await client.symbols("missing"), [])
+        self.assertTrue(client.workspace_ready)
+        self.assertEqual(len(self.requests(client)), 1)
+
+    async def test_non_roslyn_empty_is_not_retried(self):
+        client, _ = self.make_client(self.reply(1, []), server="csharp-ls")
+
+        self.assertEqual(await client.symbols("missing"), [])
+        self.assertEqual(len(self.requests(client)), 1)
+
+    async def test_cold_hit_is_returned_without_waiting(self):
+        hit = [{"name": "Quest"}]
+        client, _ = self.make_client(self.reply(1, hit))
+
+        self.assertEqual(await client.symbols("Quest"), hit)
+        self.assertFalse(client.workspace_ready)
+        self.assertEqual(len(self.requests(client)), 1)
+
+    async def test_retry_can_return_a_genuine_empty_result(self):
+        client, _ = self.make_client(self.reply(1, []), self.ready(), self.reply(2, []))
+
+        self.assertEqual(await client.symbols("missing"), [])
+        self.assertEqual(len(self.requests(client)), 2)
+
+    async def test_loading_timeout_is_bounded_and_client_can_be_used_later(self):
+        client, reader = self.make_client(self.reply(1, []))
+
+        with self.assertRaisesRegex(TimeoutError, "项目加载尚未完成"):
+            await client.symbols("Quest", timeout=0.02)
+
+        self.assertEqual(len(self.requests(client)), 1)
+        self.assertFalse(client._lock.locked())
+        hit = [{"name": "Quest"}]
+        reader.feed_data(lsp.LSPClient._frame(self.ready()))
+        reader.feed_data(lsp.LSPClient._frame(self.reply(2, hit)))
+        self.assertEqual(await client.symbols("Quest"), hit)
+        self.assertEqual(len(self.requests(client)), 2)
+
+    async def test_partial_ready_frame_timeout_can_be_completed_later(self):
+        reader = asyncio.StreamReader()
+
+        class ObservedReader:
+            def __init__(self, wrapped):
+                self.wrapped = wrapped
+                self.body_started = asyncio.Event()
+
+            async def readuntil(self, separator):
+                return await self.wrapped.readuntil(separator)
+
+            async def readexactly(self, size):
+                self.body_started.set()
+                return await self.wrapped.readexactly(size)
+
+        frame = lsp.LSPClient._frame(self.ready())
+        separator = b"\r\n\r\n"
+        header, body = frame.split(separator, 1)
+        split = max(1, len(body) // 2)
+        observed = ObservedReader(reader)
+        client = lsp.LSPClient("/tmp", "cs", ["roslyn-language-server"])
+        client.proc = FakeProcess(stdout=observed)
+        reader.feed_data(header + separator + body[:split])
+
+        waiting = asyncio.create_task(
+            client._wait_workspace_ready(lsp.time.monotonic() + 1)
+        )
+        await observed.body_started.wait()
+
+        with self.assertRaises((TimeoutError, asyncio.TimeoutError)):
+            await asyncio.wait_for(waiting, timeout=0.05)
+
+        reader.feed_data(body[split:])
+        await client._wait_workspace_ready(lsp.time.monotonic() + 1)
+        self.assertTrue(client.workspace_ready)
+
+        hit = [{"name": "Quest"}]
+        reader.feed_data(lsp.LSPClient._frame(self.reply(1, hit)))
+        self.assertEqual(await client.symbols("Quest"), hit)
+        self.assertTrue(client.workspace_ready)
+
+    async def test_eof_during_project_loading_is_reported_without_retry(self):
+        client, _ = self.make_client(self.reply(1, []), eof=True)
+        client._stderr.extend(b"project host closed")
+
+        with self.assertRaisesRegex(RuntimeError, "project host closed"):
+            await client.symbols("Quest")
+
+        self.assertEqual(len(self.requests(client)), 1)
+
+    async def test_server_error_is_not_retried(self):
+        client, _ = self.make_client(
+            {"jsonrpc": "2.0", "id": 1, "error": {"message": "broken"}}
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "broken"):
+            await client.symbols("Quest")
+
+        self.assertEqual(len(self.requests(client)), 1)
+
+    async def test_retry_uses_the_remaining_original_budget(self):
+        client, _ = self.make_client()
+        client._request = AsyncMock(side_effect=[[], [{"name": "Quest"}]])
+        clock = types.SimpleNamespace(now=100)
+
+        async def wait_workspace_ready(deadline):
+            self.assertEqual(deadline, 190)
+            clock.now = 130
+            client.workspace_ready = True
+
+        client._wait_workspace_ready = AsyncMock(side_effect=wait_workspace_ready)
+
+        with patch.object(
+            lsp, "time", types.SimpleNamespace(monotonic=lambda: clock.now)
+        ):
+            await client.symbols("Quest", timeout=90)
+
+        self.assertEqual(client._request.await_args_list[0].kwargs["timeout"], 90)
+        self.assertEqual(client._request.await_args_list[1].kwargs["timeout"], 60)
+        client._wait_workspace_ready.assert_awaited_once_with(190)
+
+    async def test_manager_shutdown_cancels_start_and_closes_new_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = lsp.LSPManager()
+            proc = FakeProcess()
+            proc.wait = AsyncMock(return_value=0)
+            start_entered = asyncio.Event()
+            start_gate = asyncio.get_running_loop().create_future()
+            clients = []
+
+            async def start(client):
+                clients.append(client)
+                client.proc = proc
+                client._request = AsyncMock(side_effect=RuntimeError("not initialized"))
+                start_entered.set()
+                await start_gate
+
+            with (
+                patch.object(lsp, "_is_windows", return_value=False),
+                patch.object(lsp, "probe", return_value=(["csharp-ls"], [])),
+                patch.object(lsp.LSPClient, "start", new=start),
+            ):
+                get_task = asyncio.create_task(manager.get(tmp, "cs", {}))
+                await start_entered.wait()
+                await manager.shutdown()
+                with self.assertRaises(asyncio.CancelledError):
+                    await get_task
+
+            self.assertEqual(len(clients), 1)
+            self.assertIsNone(clients[0].proc)
+            self.assertTrue(proc.stdin.closed)
+            self.assertTrue(proc._transport.closed)
+            self.assertTrue(proc.killed)
+            self.assertFalse(manager._starting)
+            self.assertFalse(manager._stopping)
+            self.assertFalse(manager._clients)
 
 
 if __name__ == "__main__":
