@@ -18,6 +18,7 @@ from pydantic import Field
 from pydantic.dataclasses import dataclass
 
 from .lsp import (
+    LSP_TIMEOUT_ERRORS,
     SYMBOL_KINDS,
     LSPManager,
     guess_ext,
@@ -1063,7 +1064,7 @@ class SelfSymbolsTool(FunctionTool[AstrAgentContext]):
             result = await asyncio.wait_for(
                 query_symbols(), timeout=SYMBOL_QUERY_TIMEOUT_SECONDS
             )
-        except asyncio.TimeoutError:
+        except LSP_TIMEOUT_ERRORS:
             if client is None:
                 message = "语言服务器初始化尚未完成"
             elif not client.workspace_ready:

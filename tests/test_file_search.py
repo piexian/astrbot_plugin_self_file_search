@@ -306,6 +306,22 @@ class SymbolToolBudgetTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("命中 0 条", result)
                 self.assertLessEqual(client.symbols.await_count, 1)
 
+    async def test_both_timeout_types_preserve_project_loading_phase(self):
+        for error_type in (TimeoutError, asyncio.TimeoutError):
+            with self.subTest(error_type=error_type):
+                client = types.SimpleNamespace(
+                    workspace_ready=False,
+                    symbols=AsyncMock(side_effect=error_type("loading")),
+                )
+                with patch.object(
+                    main, "_lsp_client", new=AsyncMock(return_value=client)
+                ):
+                    result = await self.tool.call(None, source="test", query="Quest")
+
+                self.assertIn("项目加载尚未完成", result)
+                self.assertNotIn("符号搜索失败", result)
+                client.symbols.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -327,6 +327,8 @@ async def _kill_process_tree(proc) -> None:
 
 
 LSP_STDERR_CAP = 16000
+# Python 3.10 的 asyncio 超时异常与内置异常不同。
+LSP_TIMEOUT_ERRORS = (TimeoutError, asyncio.TimeoutError)
 LSP_PROJECT_SUFFIXES = (".sln", ".csproj", ".fsproj")
 CSHARP_PROJECT_SERVERS = {"csharp-ls", "roslyn-language-server"}
 
@@ -624,12 +626,12 @@ class LSPClient:
             return await asyncio.wait_for(
                 self._symbols(query, timeout, path), timeout=timeout
             )
-        except asyncio.TimeoutError as exc:
+        except LSP_TIMEOUT_ERRORS as exc:
             if not self.workspace_ready:
-                raise asyncio.TimeoutError(
+                raise TimeoutError(
                     "Roslyn 项目加载尚未完成，符号查询等待超时。"
                 ) from exc
-            raise asyncio.TimeoutError("workspace/symbol 查询超时。") from exc
+            raise TimeoutError("workspace/symbol 查询超时。") from exc
 
     async def _symbols(self, query: str, timeout: float, path: str | None):
         deadline = time.monotonic() + timeout

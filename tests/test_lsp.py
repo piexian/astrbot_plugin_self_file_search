@@ -497,7 +497,7 @@ class RoslynReadinessTests(unittest.IsolatedAsyncioTestCase):
     async def test_loading_timeout_is_bounded_and_client_can_be_used_later(self):
         client, reader = self.make_client(self.reply(1, []))
 
-        with self.assertRaisesRegex(asyncio.TimeoutError, "项目加载尚未完成"):
+        with self.assertRaisesRegex(TimeoutError, "项目加载尚未完成"):
             await client.symbols("Quest", timeout=0.02)
 
         self.assertEqual(len(self.requests(client)), 1)
