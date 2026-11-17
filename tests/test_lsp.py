@@ -364,7 +364,8 @@ class ServerAdapterTests(unittest.IsolatedAsyncioTestCase):
         call = client._request.await_args
         self.assertEqual(call.args, ("workspace/symbol", {"query": "Quest"}))
         self.assertGreater(call.kwargs["timeout"], 0)
-        self.assertLessEqual(call.kwargs["timeout"], 90)
+        # deadline 与当前时间两次浮点运算的舍入可能产生不足 1e-9 秒的超调
+        self.assertLessEqual(call.kwargs["timeout"], 90 + 1e-9)
 
     async def test_cancelled_get_reuses_shared_initialization(self):
         with tempfile.TemporaryDirectory() as tmp:
