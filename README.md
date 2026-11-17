@@ -58,7 +58,7 @@ Roslyn `self_symbols` 对发起时未就绪的首次空结果等待就绪后重�
 
 工具说明和参数 schema 会直接提供以下用法约束，不依赖额外人格提示：
 
-- 文本条件默认按字面量匹配；需要正则时显式设置 `is_regex=true`，例如 `foo|bar` 或 `foo.*bar`。
+- 文本条件默认按字面量匹配；含未转义 `|`、`.*` 或正则转义的 pattern 需要 `is_regex=true`；零命中时工具会预检并返回 `[搜索纠错]`，按其中的参数修改重试。
 - `search_mode` 默认 `exact`（全量扫描）；`fts5` 只接受 3 字符以上的字面量、不区分大小写，`is_regex=true` 返回错误，`case_sensitive=true`、索引不可用或 pattern 过短时以 `[fts5 降级]` 回退 exact。
 - `file_glob` 不含目录时匹配文件名，含目录时匹配数据源相对路径，逗号分隔多个模式；不知道路径时先用 `self_glob`，空结果先检查过滤范围。
 

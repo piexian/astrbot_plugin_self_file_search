@@ -129,6 +129,93 @@ class FileSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("文件内无命中", no_content)
         self.assertIn("1/1 个候选文件", no_content)
 
+    async def test_pipe_pattern_zero_hit_reports_a_verified_regex_retry(self):
+        self.write("Code.cs", "alpha\nbeta\n")
+
+        result = await self.call_search("alpha|beta")
+
+        self.assertIn("文件内无命中", result)
+        self.assertIn("搜索纠错", result)
+        self.assertIn("正则预检发现 2 行", result)
+        self.assertIn("下一步", result)
+        self.assertIn("is_regex=true", result)
+        self.assertIn("候选预览", result)
+        self.assertIn("Code.cs:1: alpha", result)
+
+    async def test_escaped_regex_zero_hit_reports_a_verified_regex_retry(self):
+        self.write("Code.cs", "GainAbility(\n")
+
+        result = await self.call_search(r"GainAbility\(")
+
+        self.assertIn("正则预检发现 1 行", result)
+        self.assertIn("is_regex=true", result)
+        self.assertIn("Code.cs:1: GainAbility(", result)
+
+    async def test_invalid_regex_does_not_recommend_blind_retry(self):
+        self.write("Code.cs", "SetBase(2\nquality\n")
+
+        result = await self.call_search("SetBase(2|ModBase(2|quality")
+
+        self.assertIn("正则预检失败", result)
+        self.assertIn("不要直接设置 is_regex=true", result)
+        self.assertIn("候选拆分预检发现 2 行", result)
+        self.assertIn("Code.cs:1: SetBase(2", result)
+        self.assertIn("候选预览", result)
+
+    async def test_valid_regex_without_candidate_reports_no_preview(self):
+        self.write("Code.cs", "alpha\nbeta\n")
+
+        result = await self.call_search("gamma|delta")
+
+        self.assertIn("正则预检也未发现候选", result)
+        self.assertIn("is_regex=true", result)
+        self.assertNotIn("候选预览", result)
+
+    async def test_correction_respects_case_sensitive(self):
+        self.write("Code.cs", "Alpha\n")
+
+        result = await self.call_search("alpha|beta", case_sensitive=True)
+
+        self.assertIn("正则预检也未发现候选", result)
+        self.assertNotIn("Code.cs:1", result)
+
+    async def test_invalid_alternative_preview_respects_case_sensitive(self):
+        self.write("Code.cs", "SetBase(2\nquality\n")
+
+        result = await self.call_search("setbase(2|quality", case_sensitive=True)
+
+        self.assertIn("正则预检失败", result)
+        self.assertIn("Code.cs:2: quality", result)
+        self.assertNotIn("Code.cs:1", result)
+
+    async def test_pipe_correction_stays_silent_when_not_applicable(self):
+        self.write("Code.cs", "alpha|beta\n")
+
+        literal_hit = await self.call_search("alpha|beta")
+        regex_miss = await self.call_search("gamma|delta", is_regex=True)
+        plain_miss = await self.call_search("gamma")
+        no_candidates = await self.call_search("alpha|beta", file_glob="Missing.cs")
+
+        self.assertIn("命中 1 行", literal_hit)
+        self.assertNotIn("当前按字面量匹配", literal_hit)
+        self.assertNotIn("当前按字面量匹配", regex_miss)
+        self.assertNotIn("当前按字面量匹配", plain_miss)
+        self.assertIn("没有候选文件", no_candidates)
+        self.assertNotIn("当前按字面量匹配", no_candidates)
+
+    async def test_pipe_correction_stays_silent_on_incomplete_scan(self):
+        self.write("a.cs", "alpha\n")
+        self.write("b.cs", "beta\n")
+        original = main.MAX_SCAN_FILES
+        main.MAX_SCAN_FILES = 1
+        try:
+            result = await self.call_search("alpha|beta")
+        finally:
+            main.MAX_SCAN_FILES = original
+
+        self.assertIn("扫描不完整", result)
+        self.assertNotIn("搜索纠错", result)
+
     async def test_incomplete_empty_result_is_not_definitive(self):
         self.write("Thing.json", "needle\n")
         original = main.SEARCH_TIMEOUT_SECONDS

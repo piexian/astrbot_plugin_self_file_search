@@ -238,6 +238,27 @@ class FtsSearchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("search_mode=exact", result)
         self.assertNotIn("[fts5 降级]", result)
 
+    async def test_fts5_pipe_pattern_uses_exact_correction_feedback(self):
+        self.write("a.py", "alpha\nbeta\n")
+
+        result = await self.call("alpha|beta", search_mode="fts5")
+
+        self.assertTrue(result.startswith("[fts5 降级]"))
+        self.assertIn("fts5 只支持字面量", result)
+        self.assertIn("正则预检发现 2 行", result)
+        self.assertIn("search_mode=exact", result)
+        self.assertIn("候选预览", result)
+
+    async def test_fts5_ambiguous_pipe_does_not_recommend_blind_regex(self):
+        self.write("a.py", "alpha\n")
+
+        result = await self.call("a|", search_mode="fts5")
+
+        self.assertTrue(result.startswith("[fts5 降级]"))
+        self.assertIn("空的正则候选", result)
+        self.assertIn("不要直接设置 is_regex=true", result)
+        self.assertNotIn("候选预览", result)
+
     async def test_index_uses_the_plugin_data_directory(self):
         self.write("a.py", "needle\n")
         del self.plugin.search_index_path
