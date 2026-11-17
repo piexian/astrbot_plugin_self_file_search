@@ -21,6 +21,7 @@
 - LSP 服务器通用加载：PATH 探测或命令覆盖，按文件发现最近项目根目录
 - 服务器进程惰性启动、失败熔断、空闲自动关闭，支持 Windows 进程树清理
 - 输出限长 + 分页，防止撑爆上下文
+- `self_search` 可选 SQLite FTS5 trigram 索引（`search_mode=fts5`），files 按 bm25 相关性排序；索引不可用时可见降级回精确扫描
 
 ## 安装
 
@@ -37,7 +38,7 @@ https://github.com/piexian/astrbot_plugin_self_file_search
 
 | 工具 | 功能 |
 |------|------|
-| `self_search` | 目录内 grep：`mode=content`（命中行，默认）/ `files`（命中文件）/ `count`（每文件计数）；支持正则、大小写、前后文、分页、排除模式；`file_glob` 支持文件名、相对路径和逗号分隔的多个模式；空结果区分无候选文件、无内容命中与扫描不完整 |
+| `self_search` | 目录内 grep：`mode=content`（命中行，默认）/ `files`（命中文件）/ `count`（每文件计数）；支持正则、大小写、前后文、分页、排除模式；`file_glob` 支持文件名、相对路径和逗号分隔的多个模式；空结果区分无候选文件、无内容命中与扫描不完整；`search_mode=fts5` 使用插件数据目录的 SQLite 索引 |
 | `self_read` | 读取带行号的文件内容；显式指定 `start_line`/`end_line` 时只返回文件路径和带行号正文；只有请求区间自身被预算截断时才提示区间内续读；`end_line` 为负数时从末尾倒数；`files` 最多批量读取 8 项；未指定 `end_line` 时保留默认读取行为 |
 | `self_glob` | 按文件名或相对路径通配符列文件，支持逗号分隔的多个模式 |
 
@@ -58,6 +59,7 @@ Roslyn `self_symbols` 对发起时未就绪的首次空结果等待就绪后重�
 工具说明和参数 schema 会直接提供以下用法约束，不依赖额外人格提示：
 
 - 文本条件默认按字面量匹配；需要正则时显式设置 `is_regex=true`，例如 `foo|bar` 或 `foo.*bar`。
+- `search_mode` 默认 `exact`（全量扫描）；`fts5` 只接受 3 字符以上的字面量、不区分大小写，`is_regex=true` 返回错误，`case_sensitive=true`、索引不可用或 pattern 过短时以 `[fts5 降级]` 回退 exact。
 - `file_glob` 不含目录时匹配文件名，含目录时匹配数据源相对路径，逗号分隔多个模式；不知道路径时先用 `self_glob`，空结果先检查过滤范围。
 
 通用示例：
@@ -79,7 +81,7 @@ Roslyn `self_symbols` 对发起时未就绪的首次空结果等待就绪后重�
 ### 安全设计
 
 - **白名单包含校验**：所有路径 `realpath` 后必须落在数据源根目录以内，拒绝绝对路径与 `..`
-- **只读**：全部工具无写入能力
+- **只读数据源**：全部工具不写入数据源；`search_mode=fts5` 的索引（含文件文本副本）只写在插件数据目录的 `search.sqlite3`
 - **资源封顶**：单文件 8 MB、扫描 2 万文件 / 20 秒、输出 16K 字符，超限截断并提示
 - **LSP 二次校验**：语言服务器返回的位置再过一次根目录包含检查
 - **注册门控**：全部数据源停用（含 AstrBot 白名单开关）时不注册任何工具
@@ -107,6 +109,7 @@ Roslyn `self_symbols` 对发起时未就绪的首次空结果等待就绪后重�
 astrbot_plugin_self_file_search/
 ├── main.py                          # 插件入口：6 个 FunctionTool 与注册门控
 ├── lsp.py                           # 通用 LSP 后端：探测表 / 进程管理 / JSON-RPC
+├── search_index.py                  # SQLite FTS5 trigram 索引：文件元数据 / 增量同步 / bm25 查询
 ├── metadata.yaml                    # 插件元数据
 ├── _conf_schema.json                # 插件配置 Schema
 ├── tests/                           # 标准库 unittest 回归测试

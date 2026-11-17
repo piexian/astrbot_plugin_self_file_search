@@ -4,6 +4,12 @@
 
 
 
+## [1.1.2] - 2026-11-18
+
+- `self_search` 新增 `search_mode`，默认 `exact`；`fts5` 使用插件数据目录的 SQLite FTS5 trigram 索引，files 按内置 `bm25()` 相关性排序，content/count 仅重读候选文件。
+- 索引按源增量同步并事务化写入；源路径变更或数据源移除时自动清理旧索引，外部符号链接与索引自身文件不入索引。
+- FTS5/trigram 不可用、索引不可写、加锁超时、pattern 少于 3 字符或 `case_sensitive=true` 时以 `[fts5 降级]` 回退精确扫描；`is_regex=true` 返回说明性错误。
+
 ## [1.1.1] - 2026-11-12
 
 - Roslyn `self_symbols` 对未就绪的首次空结果等待 `workspace/projectInitializationComplete`，在 90 秒总预算内仅重查一次，超时直接报告。

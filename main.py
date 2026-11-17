@@ -8,7 +8,7 @@ import os
 import re
 import time
 from fnmatch import fnmatch
-from typing import Any
+from typing import Any, NamedTuple
 
 from astrbot.api import AstrBotConfig, logger, star
 from astrbot.core.agent.run_context import ContextWrapper
@@ -27,6 +27,13 @@ from .lsp import (
     to_utf16_char,
     uri_to_path,
 )
+from .search_index import (
+    FileEntry,
+    FtsIndexError,
+    FtsUnavailable,
+    SearchIndex,
+    SyncStats,
+)
 
 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".idea", ".vs"}
 # frecency：访问一次 +1，按小时半衰（约 24h 衰减到 ~5%）
@@ -43,6 +50,10 @@ MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_LINE_CHARS = 300
 SEARCH_TIMEOUT_SECONDS = 20
 SEARCH_OUTPUT_CAP = 16000
+FTS5_MIN_PATTERN_CHARS = 3  # trigram 索引无法回答更短的字面量
+FTS5_MAX_CANDIDATES = 200  # 每次最多处理多少个候选文件
+FTS5_CANDIDATE_FETCH = 400  # 先多取一些，供 file_glob/exclude_glob 过滤
+PLUGIN_NAME = "astrbot_plugin_self_file_search"  # 与 metadata.yaml 的 name 一致
 SYMBOL_QUERY_TIMEOUT_SECONDS = 90
 
 
@@ -368,6 +379,106 @@ def _compile(pattern: str, case_sensitive: bool, is_regex: bool):
     return re.compile(pattern if is_regex else re.escape(pattern), flags)
 
 
+class FtsScan(NamedTuple):
+    """工作线程里完成一次 fts5 检索后的结果。"""
+
+    order: list[str]
+    matches: dict[str, dict[int, str]]
+    total: int
+    scanned: int
+    read_incomplete: bool
+    indexed: int
+    raw_candidates: int
+    candidates: list[str]
+    ranks: dict[str, float]
+    notes: tuple[str, ...]
+    stats: SyncStats
+
+
+def _search_index(plugin) -> SearchIndex:
+    """惰性创建插件数据目录下的 search.sqlite3；测试可注入 search_index_path。"""
+    index = getattr(plugin, "_fts_index", None)
+    if index is not None:
+        return index
+    base = getattr(plugin, "search_index_path", None)
+    if not base:
+        base = str(star.StarTools.get_data_dir(PLUGIN_NAME))
+    index = SearchIndex(os.path.join(str(base), "search.sqlite3"))
+    plugin._fts_index = index
+    return index
+
+
+def _collect_index_entries(
+    root: str,
+    deadline: float,
+    excluded_paths: set[str] | None = None,
+) -> tuple[list[FileEntry], int, bool]:
+    """收集可索引文件；遍历达到文件数或时间上限时返回不完整标记。"""
+    root = os.path.realpath(root)
+    excluded = set()
+    for excluded_path in excluded_paths or ():
+        excluded.add(os.path.realpath(excluded_path))
+        excluded.add(os.path.realpath(excluded_path + "-wal"))
+        excluded.add(os.path.realpath(excluded_path + "-shm"))
+    entries: list[FileEntry] = []
+    skipped_large = 0
+    visited = 0
+    incomplete = False
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for fn in filenames:
+            if visited >= MAX_SCAN_FILES or time.monotonic() > deadline:
+                incomplete = True
+                break
+            visited += 1
+            path = os.path.join(dirpath, fn)
+            path_real = os.path.realpath(path)
+            if path_real in excluded:
+                continue
+            if path_real != root and not path_real.startswith(root + os.sep):
+                continue
+            try:
+                info = os.stat(path_real)
+            except OSError:
+                continue
+            if info.st_size > MAX_FILE_BYTES:
+                skipped_large += 1
+                continue
+            rel = os.path.relpath(path, root).replace("\\", "/")
+            entries.append(FileEntry(rel, path_real, info.st_size, info.st_mtime_ns))
+        if incomplete:
+            break
+    return entries, skipped_large, incomplete
+
+
+def _append_paging(head: str, remain: int, limit: int, offset: int, shown: int) -> str:
+    """追加剩余条数与预估页数，让模型知道还有多少、要读几页。"""
+    if not remain:
+        return head
+    pages = max(1, -(-remain // max(limit, 1)))
+    return head + (
+        f"；还剩 {remain} 条未显示，按 max_matches={limit} 估计还需 {pages} 页"
+        f"（offset={offset + shown} 起）"
+    )
+
+
+def _fit_output(head: str, entries: list[str], offset: int, limit: int) -> str:
+    """拼接正文；超过输出上限时截断并给出翻页提示。"""
+    body = "\n".join(entries)
+    if len(head) + len(body) <= SEARCH_OUTPUT_CAP:
+        return head + "\n" + body
+    shown = len(entries)
+    hint = (
+        "本次已输出 "
+        + str(shown)
+        + " 条：翻页用 offset="
+        + str(offset + shown)
+        + " 继续，或用 file_glob 收窄、max_matches 调小后重搜。"
+    )
+    body = body[: SEARCH_OUTPUT_CAP - len(head)] + "\n…（输出超限截断）" + hint
+    return head + "\n" + body
+
+
 @dataclass
 class SelfSearchTool(FunctionTool[AstrAgentContext]):
     name: str = "self_search"
@@ -377,7 +488,12 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         "to the relevant project/version; if empty, check the filter and try a "
         "simpler pattern or wider scope. mode=content returns numbered hit lines "
         "(default); files returns paths containing the pattern; count returns "
-        "per-file hit counts. Supports context_lines and offset paging."
+        "per-file hit counts. Supports context_lines and offset paging. "
+        "search_mode=exact (default) scans files with regex/case control; fts5 "
+        "uses a persistent SQLite FTS5 trigram index, accepts literal patterns of "
+        "3+ characters case-insensitively, ranks files by bm25 relevance, re-reads "
+        "only index candidates for content/count, rejects is_regex=true, and falls "
+        "back to exact with a visible [fts5 降级] note when the index is unavailable."
     )
     parameters: dict = Field(
         default_factory=lambda: {
@@ -400,6 +516,19 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                     "description": (
                         "content = hit lines (default); files = matching paths only; "
                         "count = per-file hit counts"
+                    ),
+                },
+                "search_mode": {
+                    "type": "string",
+                    "enum": ["exact", "fts5"],
+                    "description": (
+                        "Default exact: full scan, regex and case_sensitive apply. "
+                        "fts5: SQLite FTS5 trigram index; literal substrings of 3+ "
+                        "characters, case-insensitive; files ranked by bm25 relevance "
+                        "(frecency breaks ties); content/count re-read only the "
+                        "candidates. is_regex=true is an error here; shorter patterns "
+                        "or an unavailable index fall back to exact with a visible "
+                        "[fts5 降级] note."
                     ),
                 },
                 "file_glob": {
@@ -463,6 +592,9 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         mode = str(kwargs.get("mode", "content") or "content")
         if mode not in ("content", "files", "count"):
             return _err(f"mode 只支持 content/files/count，收到 {mode!r}")
+        search_mode = str(kwargs.get("search_mode", "exact") or "exact")
+        if search_mode not in ("exact", "fts5"):
+            return _err(f"search_mode 只支持 exact/fts5，收到 {search_mode!r}")
         try:
             rx = _compile(
                 pattern,
@@ -481,6 +613,51 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         globs = _parse_file_globs(kwargs.get("file_glob"))
         exclude = _parse_excludes(kwargs.get("exclude_glob"))
 
+        exact = {
+            "src": src,
+            "root": root,
+            "mode": mode,
+            "pattern": pattern,
+            "rx": rx,
+            "limit": limit,
+            "offset": offset,
+            "ctx_lines": ctx_lines,
+            "globs": globs,
+            "exclude": exclude,
+        }
+        if search_mode == "exact":
+            return await self._search_exact(**exact)
+        if bool(kwargs.get("is_regex", False)):
+            return _err(
+                "fts5 只支持字面量子串（trigram 索引），不支持 is_regex=true；"
+                "请改用 search_mode=exact。"
+            )
+        reason = self._fts5_degrade_reason(pattern, kwargs)
+        if reason is None:
+            try:
+                return await self._search_fts5(**exact)
+            except (FtsUnavailable, FtsIndexError) as exc:
+                reason = f"FTS5 索引不可用：{exc}"
+        # 降级也要可见：先说明原因，再给出 exact 的完整结果
+        return (
+            f"[fts5 降级] {reason}；已改用 exact 扫描。\n"
+            + await self._search_exact(**exact)
+        )
+
+    async def _search_exact(
+        self,
+        *,
+        src: str,
+        root: str,
+        mode: str,
+        pattern: str,
+        rx,
+        limit: int,
+        offset: int,
+        ctx_lines: int,
+        globs: list[str],
+        exclude: list[str],
+    ) -> str:
         # 收集每个文件的命中行号（含行文本），扫描由文件数/时限双封顶
         matches: dict[str, dict[int, str]] = {}
         order: list[str] = []
@@ -555,17 +732,11 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             head += f"，命中 {total} 行"
         if incomplete:
             head += "（达到上限或扫描超时，结果可能不全，可缩小 pattern 或加 file_glob 再搜）"
-        # 剩余条数 + 预估页数：让模型知道还有多少、要读几页
         if mode == "content":
             remain = max(0, total - offset - len(entries))
         else:
             remain = max(0, len(order) - offset - len(entries))
-        if remain:
-            pages = max(1, -(-remain // max(limit, 1)))
-            head += (
-                f"；还剩 {remain} 条未显示，按 max_matches={limit} 估计还需 {pages} 页"
-                f"（offset={offset + len(entries)} 起）"
-            )
+        head = _append_paging(head, remain, limit, offset, len(entries))
         if not entries:
             if order:
                 return f"{head}，本页无内容，请检查 offset。"
@@ -578,22 +749,226 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             return (
                 f"{head}，已扫描 {scanned}/{candidate_files} 个候选文件，文件内无命中。"
             )
-        body = "\n".join(entries)
-        if len(head) + len(body) > SEARCH_OUTPUT_CAP:
-            shown = len(entries)
-            next_hint = (
-                "本次已输出 "
-                + str(shown)
-                + " 条：翻页用 offset="
-                + str(offset + shown)
-                + " 继续，或用 file_glob 收窄、max_matches 调小后重搜。"
+        return _fit_output(head, entries, offset, limit)
+
+    async def _search_fts5(
+        self,
+        *,
+        src: str,
+        root: str,
+        mode: str,
+        pattern: str,
+        rx,
+        limit: int,
+        offset: int,
+        ctx_lines: int,
+        globs: list[str],
+        exclude: list[str],
+    ) -> str:
+        index = _search_index(self.plugin_ref)
+        active_sources = (
+            set(_sources(self.plugin_ref.config)) if self.plugin_ref else {src}
+        )
+        scan = await asyncio.to_thread(
+            self._fts_scan,
+            index,
+            src,
+            root,
+            pattern,
+            rx,
+            mode,
+            globs,
+            exclude,
+            active_sources,
+        )
+        logger.debug(
+            f"self_search fts5: {src} mode={mode} pattern={pattern!r} "
+            f"indexed={scan.indexed} candidates={len(scan.candidates)} "
+            f"hits={scan.total} notes={len(scan.notes)}"
+        )
+        head = f"{_stamp(root)}[{src}] fts5 {mode} 模式"
+        if mode == "files":
+            order = self._rank_fts(src, scan.candidates, scan.ranks)
+            page = order[offset : offset + limit]
+            entries = [f"{rel}{self._frecency_tag(src, rel)}" for rel in page]
+            head += f"，索引命中文件 {len(order)} 个（按 bm25 相关性排序）"
+            self._bump(src, page)
+        elif mode == "count":
+            page = scan.order[offset : offset + limit]
+            entries = [f"{rel}: {len(scan.matches[rel])}" for rel in page]
+            head += f"，命中文件 {len(scan.order)} 个，共 {scan.total} 处"
+        else:
+            entries = self._render_content(
+                root, scan.order, scan.matches, ctx_lines, limit, offset
             )
-            body = (
-                body[: SEARCH_OUTPUT_CAP - len(head)]
-                + "\n…（输出超限截断）"
-                + next_hint
+            head += f"，命中 {scan.total} 行"
+        if mode != "files" and len(scan.candidates) > 1:
+            head += "（候选按 bm25 相关性排序）"
+        if scan.notes:
+            head += "（" + "；".join(scan.notes) + "）"
+        if mode == "content":
+            remain = max(0, scan.total - offset - len(entries))
+        else:
+            pageable = len(scan.candidates) if mode == "files" else len(scan.order)
+            remain = max(0, pageable - offset - len(entries))
+        head = _append_paging(head, remain, limit, offset, len(entries))
+        if not entries:
+            has_page_source = scan.candidates if mode == "files" else scan.order
+            if has_page_source:
+                return f"{head}，本页无内容，请检查 offset。"
+            if scan.candidates:
+                if scan.read_incomplete:
+                    return (
+                        f"{head}，已重读 {scan.scanned}/{len(scan.candidates)} 个候选文件，"
+                        "重读未完成，尚不能据此认定内容不存在。"
+                    )
+                return (
+                    f"{head}，候选文件重新读取后没有命中行（索引可能过期），"
+                    "可重试或用 search_mode=exact 复核。"
+                )
+            if scan.raw_candidates:
+                return (
+                    f"{head}，fts5 候选都被 file_glob/exclude_glob 排除，"
+                    "请检查过滤条件。"
+                )
+            if scan.indexed == 0:
+                return (
+                    f"{head}，数据源内没有可索引文件（空目录、遍历未完成或全部超过 8 MB），"
+                    "请用 self_glob 确认路径。"
+                )
+            if scan.notes:
+                return (
+                    f"{head}，fts5 索引已同步 {scan.stats.total} 个文件，"
+                    "但本次更新或候选扫描不完整，尚不能据此认定内容不存在。"
+                )
+            return (
+                f"{head}，fts5 索引已同步 {scan.stats.total} 个文件，未命中候选；"
+                "可换 3 字符以上的字面量，或用 search_mode=exact 复核。"
             )
-        return head + "\n" + body
+        return _fit_output(head, entries, offset, limit)
+
+    def _fts_scan(
+        self,
+        index: SearchIndex,
+        src: str,
+        root: str,
+        pattern: str,
+        rx,
+        mode: str,
+        globs: list[str],
+        exclude: list[str],
+        active_sources: set[str],
+    ) -> FtsScan:
+        """在工作线程里完成：遍历→增量索引→bm25 候选→按需重读候选。"""
+        root = os.path.realpath(root)
+        index.prune_sources(active_sources)
+        deadline = time.monotonic() + SEARCH_TIMEOUT_SECONDS
+        entries, skipped_large, walk_incomplete = _collect_index_entries(
+            root, deadline, {index.db_path}
+        )
+        stats = index.sync(
+            src,
+            root,
+            entries,
+            complete=not walk_incomplete,
+            deadline=deadline,
+        )
+        rows = index.search(src, pattern, FTS5_CANDIDATE_FETCH)
+        notes: list[str] = []
+        if walk_incomplete:
+            notes.append(
+                f"目录遍历达到 {MAX_SCAN_FILES} 个文件或 {SEARCH_TIMEOUT_SECONDS} 秒上限"
+            )
+        if stats.truncated:
+            notes.append(
+                f"索引更新达到 {SEARCH_TIMEOUT_SECONDS} 秒预算，部分变化文件留待下次"
+            )
+        if stats.unstable:
+            notes.append(f"{len(stats.unstable)} 个文件读取时仍在变化，未写入索引")
+        if skipped_large:
+            notes.append(f"已跳过 {skipped_large} 个超过 {MAX_FILE_BYTES} 字节的文件")
+        filtered = [
+            (rel, rank)
+            for rel, rank in rows
+            if _matches_file_globs(rel, globs)
+            and not (exclude and _is_excluded(rel, exclude))
+        ]
+        truncated = (
+            len(rows) >= FTS5_CANDIDATE_FETCH or len(filtered) > FTS5_MAX_CANDIDATES
+        )
+        filtered = filtered[:FTS5_MAX_CANDIDATES]
+        if truncated:
+            notes.append(f"候选达到上限 {FTS5_MAX_CANDIDATES} 个，结果可能不全")
+        candidates = [rel for rel, _ in filtered]
+        ranks = dict(filtered)
+        matches: dict[str, dict[int, str]] = {}
+        order: list[str] = []
+        total = 0
+        scanned = 0
+        read_incomplete = False
+        if mode in ("content", "count") and candidates:
+            hit_cap = False
+            for rel in candidates:
+                if hit_cap or time.monotonic() > deadline:
+                    read_incomplete = True
+                    notes.append(
+                        f"候选重读达到 {SEARCH_TIMEOUT_SECONDS} 秒或 5000 行上限，"
+                        "结果可能不全"
+                    )
+                    break
+                abs_path = _contain(root, rel)
+                if abs_path is None:
+                    read_incomplete = True
+                    if "候选路径越出数据源根目录，已跳过" not in notes:
+                        notes.append("候选路径越出数据源根目录，已跳过")
+                    continue
+                lines = _read_lines(abs_path)
+                scanned += 1
+                hit_lines: dict[int, str] = {}
+                for i, line in enumerate(lines, 1):
+                    if not rx.search(line):
+                        continue
+                    hit_lines[i] = line.rstrip()[:MAX_LINE_CHARS]
+                    total += 1
+                    if total >= 5000:
+                        hit_cap = True
+                        break
+                if hit_lines:
+                    matches[rel] = hit_lines
+                    order.append(rel)
+        return FtsScan(
+            order=order,
+            matches=matches,
+            total=total,
+            scanned=scanned,
+            read_incomplete=read_incomplete,
+            indexed=len(entries),
+            raw_candidates=len(rows),
+            candidates=candidates,
+            ranks=ranks,
+            notes=tuple(notes),
+            stats=stats,
+        )
+
+    def _rank_fts(
+        self, src: str, order: list[str], ranks: dict[str, float]
+    ) -> list[str]:
+        """bm25 升序（越负越相关），同分按 frecency 降序。"""
+        return sorted(
+            order, key=lambda rel: (ranks.get(rel, 0.0), -self._score(src, rel))
+        )
+
+    def _fts5_degrade_reason(self, pattern: str, kwargs: dict) -> str | None:
+        """fts5 无法表达该查询时返回降级原因，否则返回 None。"""
+        if bool(kwargs.get("case_sensitive", False)):
+            return "fts5 索引不区分大小写，无法满足 case_sensitive=true"
+        if len(pattern) < FTS5_MIN_PATTERN_CHARS:
+            return f"pattern 少于 {FTS5_MIN_PATTERN_CHARS} 字符，trigram 索引无法匹配"
+        try:
+            _search_index(self.plugin_ref)
+        except (AttributeError, RuntimeError, ValueError, OSError) as exc:
+            return f"无法创建索引：{exc}"
+        return None
 
     def _score(self, src: str, rel: str) -> float:
         plugin = self.plugin_ref
@@ -632,7 +1007,9 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             if emitted >= limit:
                 break
             line_map = matches[rel]
-            abs_path = os.path.join(root, rel.replace("/", os.sep))
+            abs_path = _contain(root, rel)
+            if abs_path is None:
+                continue
             if ctx_lines <= 0:
                 for line1 in sorted(line_map):
                     if emitted >= limit:
