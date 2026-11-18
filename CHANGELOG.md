@@ -4,6 +4,10 @@
 
 
 
+## [未发布]
+
+- `self_search` 对疑似正则误用的零命中执行语法与候选预检，返回带候选证据和明确重试参数的 `[搜索纠错]`，不改变原始字面量语义。
+
 ## [1.1.2] - 2026-11-18
 
 - `self_search` 新增 `search_mode`，默认 `exact`；`fts5` 使用插件数据目录的 SQLite FTS5 trigram 索引，files 按内置 `bm25()` 相关性排序，content/count 仅重读候选文件。
