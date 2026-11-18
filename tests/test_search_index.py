@@ -368,6 +368,11 @@ class FtsSearchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("link.txt", result)
 
+        downgraded = await self.call(
+            "outside-secret|missing", mode="files", search_mode="fts5"
+        )
+        self.assertNotIn("link.txt", downgraded)
+
 
 class SearchIndexTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:

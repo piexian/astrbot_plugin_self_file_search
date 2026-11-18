@@ -47,6 +47,7 @@ FRECENCY_DROP_SCORE = 0.05  # 衰减到这个分数以下就删（约 5 天未�
 FRECENCY_MAX_TOTAL = 5000  # 全局条目硬上限
 MAX_SCAN_FILES = 20000
 MAX_FILE_BYTES = 8 * 1024 * 1024
+MAX_SEARCH_HITS = 5000
 MAX_LINE_CHARS = 300
 SEARCH_TIMEOUT_SECONDS = 20
 SEARCH_OUTPUT_CAP = 16000
@@ -365,13 +366,13 @@ def _is_excluded(rel: str, exclude: list[str]) -> bool:
     return False
 
 
-def _read_lines(path: str) -> list[str]:
-    """同步读全部行（供 asyncio.to_thread 调用，避免 async 里阻塞 open）。"""
+def _read_lines(path: str) -> tuple[list[str], bool]:
+    """同步读全部行，返回内容和读取是否成功。"""
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
-            return f.readlines()
+            return f.readlines(), True
     except OSError:
-        return []
+        return [], False
 
 
 def _compile(pattern: str, case_sensitive: bool, is_regex: bool):
@@ -381,68 +382,151 @@ def _compile(pattern: str, case_sensitive: bool, is_regex: bool):
 
 CORRECTION_PREVIEW_MATCHES = 24
 CORRECTION_PREVIEW_ENTRIES = 6
-_REGEX_ESCAPED_META = frozenset(".\\+*?()[]{}|^$")
+_REGEX_ESCAPED_META = frozenset(".\\\\+*?()[]{}|^$")
+_REGEX_SHORTHAND = frozenset("dDsSwWbBAZzG")
+_REGEX_ESCAPES = _REGEX_ESCAPED_META | _REGEX_SHORTHAND
 
 
 class SearchCorrection(NamedTuple):
-    """描述一次疑似正则误用及其可选的预检表达式。"""
+    """描述一次疑似正则误用及其安全字面量预检。"""
 
     kind: str
-    regex: Any | None
     error: str | None
-    alternatives: tuple[str, ...]
+    preview_regexes: tuple[Any, ...]
+
+
+def _is_unescaped(pattern: str, index: int) -> bool:
+    slashes = 0
+    cursor = index - 1
+    while cursor >= 0 and pattern[cursor] == "\\":
+        slashes += 1
+        cursor -= 1
+    return slashes % 2 == 0
 
 
 def _has_unescaped(pattern: str, target: str) -> bool:
+    return any(
+        char == target and _is_unescaped(pattern, index)
+        for index, char in enumerate(pattern)
+    )
+
+
+def _split_unescaped(pattern: str, target: str) -> tuple[str, ...]:
+    parts: list[str] = []
+    start = 0
     for index, char in enumerate(pattern):
-        if char != target:
+        if char == target and _is_unescaped(pattern, index):
+            parts.append(pattern[start:index].strip())
+            start = index + 1
+    parts.append(pattern[start:].strip())
+    return tuple(parts)
+
+
+def _has_regex_escape(pattern: str, targets: frozenset[str] = _REGEX_ESCAPES) -> bool:
+    index = 0
+    while index < len(pattern) - 1:
+        if pattern[index] != "\\":
+            index += 1
             continue
-        slashes = 0
-        cursor = index - 1
-        while cursor >= 0 and pattern[cursor] == "\\":
-            slashes += 1
-            cursor -= 1
-        if slashes % 2 == 0:
+        start = index
+        while index < len(pattern) and pattern[index] == "\\":
+            index += 1
+        if (
+            (index - start) % 2 == 1
+            and index < len(pattern)
+            and pattern[index] in targets
+        ):
             return True
     return False
 
 
-def _has_regex_escape(pattern: str) -> bool:
-    for index, char in enumerate(pattern[:-1]):
+def _has_unescaped_wildcard(pattern: str) -> bool:
+    return any(
+        pattern[index : index + 2] in (".*", ".+") and _is_unescaped(pattern, index)
+        for index in range(len(pattern) - 1)
+    )
+
+
+def _has_unescaped_char_class(pattern: str) -> bool:
+    for index, char in enumerate(pattern):
+        if char != "[" or not _is_unescaped(pattern, index):
+            continue
+        for end in range(index + 1, len(pattern)):
+            if pattern[end] == "]" and _is_unescaped(pattern, end):
+                return True
+    return False
+
+
+_REGEX_OPERATORS = frozenset(".^$*+?()[]{}|")
+
+
+def _has_unescaped_regex_operator(pattern: str) -> bool:
+    return any(
+        char in _REGEX_OPERATORS and _is_unescaped(pattern, index)
+        for index, char in enumerate(pattern)
+    )
+
+
+def _literal_candidate(part: str) -> str | None:
+    chars: list[str] = []
+    index = 0
+    while index < len(part):
+        char = part[index]
         if char != "\\":
+            chars.append(char)
+            index += 1
             continue
-        slashes = 0
-        cursor = index
-        while cursor >= 0 and pattern[cursor] == "\\":
-            slashes += 1
-            cursor -= 1
-        if slashes % 2 == 1 and pattern[index + 1] in _REGEX_ESCAPED_META:
-            return True
-    return False
+        if index + 1 >= len(part) or part[index + 1] not in _REGEX_ESCAPED_META:
+            return None
+        chars.append(part[index + 1])
+        index += 2
+    return "".join(chars)
+
+
+def _safe_preview(parts: tuple[str, ...], case_sensitive: bool) -> tuple[Any, ...]:
+    seen: set[str] = set()
+    regexes: list[Any] = []
+    for part in parts:
+        literal = _literal_candidate(part)
+        if (
+            not literal
+            or _has_unescaped_wildcard(part)
+            or _has_unescaped_char_class(part)
+            or literal in seen
+        ):
+            continue
+        seen.add(literal)
+        regexes.append(_compile(literal, case_sensitive, False))
+    return tuple(regexes)
 
 
 def _search_correction_plan(
     pattern: str, is_regex: bool, case_sensitive: bool = False
 ) -> SearchCorrection | None:
-    """识别高置信度的正则误用，不改变原始搜索语义。"""
+    """识别高置信度的正则误用，并只准备安全的字面量预检。"""
     if is_regex:
         return None
     has_pipe = _has_unescaped(pattern, "|")
-    parts = tuple(part.strip() for part in pattern.split("|")) if has_pipe else ()
+    parts = (
+        _split_unescaped(pattern, "|")
+        if has_pipe
+        else (pattern,)
+        if _has_regex_escape(pattern)
+        else ()
+    )
     has_regex_shape = (
-        has_pipe
-        or _has_regex_escape(pattern)
-        or re.search(r"(?<!\\)\.\*|(?<!\\)\.\+", pattern) is not None
+        has_pipe or _has_regex_escape(pattern) or _has_unescaped_regex_operator(pattern)
     )
     if not has_regex_shape:
         return None
     if has_pipe and any(not part for part in parts):
-        return SearchCorrection("ambiguous", None, "| 两侧存在空候选", ())
+        return SearchCorrection("ambiguous", "| 两侧存在空候选", ())
+    preview_regexes = _safe_preview(parts, case_sensitive)
     try:
-        regex = _compile(pattern, case_sensitive, True)
+        _compile(pattern, case_sensitive, True)
     except re.error as exc:
-        return SearchCorrection("invalid", None, str(exc), parts)
-    return SearchCorrection("regex", regex, None, ())
+        return SearchCorrection("invalid", str(exc), preview_regexes)
+    return SearchCorrection("regex", None, preview_regexes)
 
 
 class FtsScan(NamedTuple):
@@ -550,7 +634,7 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
     name: str = "self_search"
     description: str = (
         "Search file contents using short identifiers or literal text; regex needs "
-        "is_regex=true. Do not use regex alternatives with is_regex=false; follow [搜索纠错] and change only named fields. Confirm uncertain paths with self_glob. Narrow file_glob "
+        "is_regex=true. Do not use regex alternatives with is_regex=false; follow [搜索纠错]; correction preview uses safe literals only, and complex regex is not executed; change only named fields. Confirm uncertain paths with self_glob. Narrow file_glob "
         "to the relevant project/version; if empty, check the filter and try a "
         "simpler pattern or wider scope. mode=content returns numbered hit lines "
         "(default); files returns paths containing the pattern; count returns "
@@ -572,8 +656,8 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 "pattern": {
                     "type": "string",
                     "description": (
-                        "Literal substring by default. For unescaped |, .*, or escaped regex punctuation, "
-                        "set is_regex=true; after [搜索纠错], keep pattern and filters unchanged. Use identifiers, not questions."
+                        "Literal substring by default. For unescaped |, .*, character classes, or escaped regex punctuation, "
+                        "set is_regex=true; correction preview uses safe literals only; after [搜索纠错], keep pattern and filters unchanged. Use identifiers, not questions."
                     ),
                 },
                 "mode": {
@@ -742,10 +826,12 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         correction_matches: dict[str, dict[int, str]] = {}
         correction_order: list[str] = []
         correction_total = 0
+        correction_file_total = 0
+        correction_files_seen: set[str] = set()
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
             for fn in filenames:
-                if scanned >= MAX_SCAN_FILES or time.monotonic() > deadline:
+                if candidate_files >= MAX_SCAN_FILES or time.monotonic() > deadline:
                     incomplete = True
                     break
                 rel = os.path.relpath(os.path.join(dirpath, fn), root).replace(
@@ -756,11 +842,19 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 if exclude and _is_excluded(rel, exclude):
                     continue
                 candidate_files += 1
-                path = os.path.join(dirpath, fn)
+                path = _contain(root, rel)
+                if path is None:
+                    incomplete = True
+                    continue
                 try:
                     if os.path.getsize(path) > MAX_FILE_BYTES:
+                        incomplete = True
                         continue
-                    lines = await asyncio.to_thread(_read_lines, path)
+                    scanned += 1
+                    lines, read_ok = await asyncio.to_thread(_read_lines, path)
+                    if not read_ok:
+                        incomplete = True
+                        continue
                     for i, line in enumerate(lines, 1):
                         if rx.search(line):
                             if rel not in matches:
@@ -768,45 +862,35 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                                 order.append(rel)
                             matches[rel][i] = line.rstrip()[:MAX_LINE_CHARS]
                             total += 1
-                        else:
-                            correction_match = False
-                            if (
-                                correction_plan
-                                and correction_total < CORRECTION_PREVIEW_MATCHES
-                            ):
-                                if correction_plan.regex is not None:
-                                    correction_match = bool(
-                                        correction_plan.regex.search(line)
-                                    )
-                                elif correction_plan.alternatives:
-                                    if case_sensitive:
-                                        correction_match = any(
-                                            part in line
-                                            for part in correction_plan.alternatives
-                                        )
-                                    else:
-                                        folded = line.casefold()
-                                        correction_match = any(
-                                            part.casefold() in folded
-                                            for part in correction_plan.alternatives
-                                        )
-                            if correction_match:
-                                if rel not in correction_matches:
-                                    correction_matches[rel] = {}
-                                    correction_order.append(rel)
-                                correction_matches[rel][i] = line.rstrip()[
-                                    :MAX_LINE_CHARS
-                                ]
-                                correction_total += 1
-                            if total >= 5000:
+                            if total >= MAX_SEARCH_HITS:
                                 incomplete = True
                                 break
+                            continue
+                        if not (correction_plan and correction_plan.preview_regexes):
+                            continue
+                        correction_match = any(
+                            preview.search(line)
+                            for preview in correction_plan.preview_regexes
+                        )
+                        if not correction_match:
+                            continue
+                        correction_total += 1
+                        if rel not in correction_files_seen:
+                            correction_files_seen.add(rel)
+                            correction_file_total += 1
+                        if correction_total > CORRECTION_PREVIEW_MATCHES:
+                            continue
+                        if rel not in correction_matches:
+                            correction_matches[rel] = {}
+                            correction_order.append(rel)
+                        correction_matches[rel][i] = line.rstrip()[:MAX_LINE_CHARS]
                 except OSError:
+                    incomplete = True
                     continue
-                scanned += 1
+                if total >= MAX_SEARCH_HITS:
+                    break
             if incomplete:
                 break
-
         logger.debug(
             f"self_search: {src} mode={mode} pattern={pattern!r} "
             f"total={total} scanned={scanned} incomplete={incomplete}"
@@ -860,6 +944,7 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 order=correction_order,
                 matches=correction_matches,
                 total=correction_total,
+                file_total=correction_file_total,
             )
             return f"{head}，已扫描 {scanned}/{candidate_files} 个候选文件，文件内无命中。{feedback}"
         return _fit_output(head, entries, offset, limit)
@@ -874,6 +959,7 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
         order: list[str],
         matches: dict[str, dict[int, str]],
         total: int,
+        file_total: int,
     ) -> str:
         """为高置信度的疑似正则误用生成可执行的纠错反馈。"""
         if plan is None:
@@ -887,7 +973,7 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                     f"{rel}（{len(matches[rel])} 处）"
                     for rel in order[:CORRECTION_PREVIEW_ENTRIES]
                 ]
-                summary = f"{len(order)} 个文件"
+                summary = f"{file_total} 个文件"
             elif mode == "count":
                 preview = [
                     f"{rel}: {len(matches[rel])}"
@@ -922,7 +1008,7 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             if order:
                 return (
                     "\n[搜索纠错] 原查询按字面量匹配且未命中；疑似正则预检失败："
-                    f"{plan.error}。相同范围的候选拆分预检发现 {summary}。"
+                    f"{plan.error}。相同范围的候选拆分预检发现 {summary}（仅执行安全字面量匹配）。"
                     "\n[下一步] 不要直接设置 is_regex=true；按候选拆分为多个独立 pattern 后分别重试。"
                     + preview_text
                 )
@@ -936,14 +1022,22 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
             if search_mode == "fts5"
             else "仅将 is_regex=true 后重试。"
         )
+        if not plan.preview_regexes:
+            return (
+                "\n[搜索纠错] 原查询按字面量匹配且未命中；检测到疑似正则结构，"
+                "复杂正则未执行安全候选预检，当前没有候选预览。"
+                f"\n[下一步] {retry}"
+            )
         if order:
             return (
                 "\n[搜索纠错] 原查询按字面量匹配且未命中；检测到疑似正则结构，"
-                f"相同范围的正则预检发现 {summary}。\n[下一步] {retry}" + preview_text
+                f"相同范围的正则预检发现 {summary}（仅执行安全字面量匹配）。"
+                f"\n[下一步] {retry}" + preview_text
             )
         return (
             "\n[搜索纠错] 原查询按字面量匹配且未命中；检测到疑似正则结构，"
-            f"相同范围的正则预检也未发现候选。\n[下一步] 如果你的意图是多个候选，{retry}"
+            f"相同范围的正则预检也未发现候选（仅执行安全字面量匹配）。"
+            f"\n[下一步] 如果你的意图是多个候选，{retry}"
             "当前数据没有提供可确认的候选结果。"
         )
 
@@ -1111,7 +1205,7 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                 if hit_cap or time.monotonic() > deadline:
                     read_incomplete = True
                     notes.append(
-                        f"候选重读达到 {SEARCH_TIMEOUT_SECONDS} 秒或 5000 行上限，"
+                        f"候选重读达到 {SEARCH_TIMEOUT_SECONDS} 秒或 {MAX_SEARCH_HITS} 行上限，"
                         "结果可能不全"
                     )
                     break
@@ -1121,15 +1215,20 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
                     if "候选路径越出数据源根目录，已跳过" not in notes:
                         notes.append("候选路径越出数据源根目录，已跳过")
                     continue
-                lines = _read_lines(abs_path)
+                lines, read_ok = _read_lines(abs_path)
                 scanned += 1
+                if not read_ok:
+                    read_incomplete = True
+                    if "候选文件读取失败，结果可能不全" not in notes:
+                        notes.append("候选文件读取失败，结果可能不全")
+                    continue
                 hit_lines: dict[int, str] = {}
                 for i, line in enumerate(lines, 1):
                     if not rx.search(line):
                         continue
                     hit_lines[i] = line.rstrip()[:MAX_LINE_CHARS]
                     total += 1
-                    if total >= 5000:
+                    if total >= MAX_SEARCH_HITS:
                         hit_cap = True
                         break
                 if hit_lines:
@@ -1159,7 +1258,13 @@ class SelfSearchTool(FunctionTool[AstrAgentContext]):
 
     def _fts5_degrade_reason(self, pattern: str, kwargs: dict) -> str | None:
         """fts5 无法表达该查询时返回降级原因，否则返回 None。"""
-        if _search_correction_plan(
+        requires_exact = (
+            _has_unescaped(pattern, "|")
+            or _has_regex_escape(pattern)
+            or _has_unescaped_wildcard(pattern)
+            or _has_unescaped_char_class(pattern)
+        )
+        if requires_exact and _search_correction_plan(
             pattern,
             bool(kwargs.get("is_regex", False)),
             bool(kwargs.get("case_sensitive", False)),

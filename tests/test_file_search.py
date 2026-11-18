@@ -197,11 +197,11 @@ class FileSearchTests(unittest.IsolatedAsyncioTestCase):
         no_candidates = await self.call_search("alpha|beta", file_glob="Missing.cs")
 
         self.assertIn("命中 1 行", literal_hit)
-        self.assertNotIn("当前按字面量匹配", literal_hit)
-        self.assertNotIn("当前按字面量匹配", regex_miss)
-        self.assertNotIn("当前按字面量匹配", plain_miss)
+        self.assertNotIn("[搜索纠错]", literal_hit)
+        self.assertNotIn("[搜索纠错]", regex_miss)
+        self.assertNotIn("[搜索纠错]", plain_miss)
         self.assertIn("没有候选文件", no_candidates)
-        self.assertNotIn("当前按字面量匹配", no_candidates)
+        self.assertNotIn("[搜索纠错]", no_candidates)
 
     async def test_pipe_correction_stays_silent_on_incomplete_scan(self):
         self.write("a.cs", "alpha\n")
@@ -215,6 +215,89 @@ class FileSearchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("扫描不完整", result)
         self.assertNotIn("搜索纠错", result)
+
+    async def test_matching_hits_stop_at_search_limit(self):
+        self.write("many.cs", "needle\n" * 5)
+        self.write("other.cs", "needle\n" * 5)
+        original = main.MAX_SEARCH_HITS
+        main.MAX_SEARCH_HITS = 3
+        try:
+            result = await self.call_search("needle", mode="count")
+        finally:
+            main.MAX_SEARCH_HITS = original
+
+        self.assertIn("共 3 处", result)
+        self.assertIn("结果可能不全", result)
+
+    async def test_oversized_file_makes_correction_scan_incomplete(self):
+        self.write("large.cs", "alpha\n")
+        original = main.MAX_FILE_BYTES
+        main.MAX_FILE_BYTES = 1
+        try:
+            result = await self.call_search("alpha|beta", file_glob="large.cs")
+        finally:
+            main.MAX_FILE_BYTES = original
+
+        self.assertIn("扫描不完整", result)
+        self.assertNotIn("[搜索纠错]", result)
+
+    async def test_read_failure_makes_correction_scan_incomplete(self):
+        self.write("unreadable.cs", "alpha\n")
+
+        with patch.object(main, "_read_lines", return_value=([], False)):
+            result = await self.call_search("alpha|beta", file_glob="unreadable.cs")
+
+        self.assertIn("扫描不完整", result)
+        self.assertNotIn("[搜索纠错]", result)
+
+    async def test_complex_regex_shapes_skip_regex_preview(self):
+        self.write("Code.cs", "ABC\n123\n")
+
+        for pattern in ("[A-Z]", r"\d+", r"(a+)+$"):
+            with self.subTest(pattern=pattern):
+                result = await self.call_search(pattern, file_glob="Code.cs")
+                self.assertIn("复杂正则未执行安全候选预检", result)
+                self.assertNotIn("[候选预览", result)
+                plan = main._search_correction_plan(pattern, False)
+                self.assertIsNotNone(plan)
+                self.assertFalse(plan.preview_regexes)
+
+    async def test_escaped_pipe_and_literal_candidate_are_split_safely(self):
+        self.write("Code.cs", "foo|\nbar\n")
+
+        result = await self.call_search(r"foo\||bar", file_glob="Code.cs")
+
+        self.assertIn("正则预检发现 2 行", result)
+        self.assertIn("Code.cs:1: foo|", result)
+        self.assertIn("Code.cs:2: bar", result)
+
+    async def test_invalid_regex_preview_unescapes_literal_candidates(self):
+        self.write("Code.cs", "GainAbility(\n")
+
+        result = await self.call_search(r"GainAbility\(|SetBase(2", file_glob="Code.cs")
+
+        self.assertIn("正则预检失败", result)
+        self.assertIn("候选拆分预检发现 1 行", result)
+        self.assertIn("Code.cs:1: GainAbility(", result)
+
+    async def test_case_insensitive_preview_matches_retry_semantics(self):
+        self.write("Code.cs", "Straße\n")
+
+        result = await self.call_search("STRASSE|other", file_glob="Code.cs")
+
+        self.assertIn("正则预检也未发现候选", result)
+        self.assertNotIn("Straße", result)
+
+    async def test_correction_total_continues_after_preview_cap(self):
+        for index in range(30):
+            self.write(f"candidate-{index:02}.cs", "alpha\n")
+
+        result = await self.call_search("alpha|beta")
+        files = await self.call_search("alpha|beta", mode="files")
+
+        self.assertIn("正则预检发现 30 行", result)
+        self.assertIn("候选预览已封顶", result)
+        self.assertIn("正则预检发现 30 个文件", files)
 
     async def test_incomplete_empty_result_is_not_definitive(self):
         self.write("Thing.json", "needle\n")
